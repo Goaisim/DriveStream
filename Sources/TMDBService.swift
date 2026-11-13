@@ -125,6 +125,9 @@ final class TMDBService {
 
                 let rawPrefix = String(baseName[..<fullRange.lowerBound])
                 var cleanedTitle = cleanTitle(rawPrefix)
+                if isSeasonFolderName(cleanedTitle) {
+                    cleanedTitle = ""
+                }
                 if cleanedTitle.isEmpty, let validFolderHint, !validFolderHint.isEmpty {
                     cleanedTitle = validFolderHint
                 }
@@ -135,9 +138,16 @@ final class TMDBService {
             }
         }
 
-        let cleaned = cleanTitle(baseName)
+        var cleaned = cleanTitle(baseName)
+        if isSeasonFolderName(cleaned) {
+            cleaned = ""
+        }
         let resolved = cleaned.isEmpty ? (validFolderHint ?? baseName) : cleaned
         return ParsedMediaInfo(title: resolved, season: nil, episode: nil)
+    }
+
+    func isSeasonOnlyTitle(_ title: String) -> Bool {
+        isSeasonFolderName(title.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     func metadata(for file: DriveFile) async -> TMDBMetadata {

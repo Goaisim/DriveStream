@@ -8,6 +8,7 @@ final class LocalStreamProxy {
     private let queue = DispatchQueue(label: "com.drake.drivestream.proxy", qos: .userInitiated)
     private var listener: NWListener?
     private weak var authManager: AuthManager?
+    private var readyWaiters: [CheckedContinuation<Void, Never>] = []
 
     private init() {}
 
@@ -15,6 +16,27 @@ final class LocalStreamProxy {
         self.authManager = authManager
         queue.async { [weak self] in
             self?.ensureListenerRunning()
+        }
+    }
+
+    func ensureReady(authManager: AuthManager) async {
+        self.authManager = authManager
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            queue.async { [weak self] in
+                guard let self else {
+                    continuation.resume()
+                    return
+                }
+                self.ensureListenerRunning()
+                if self.listener?.state == .ready {
+                    continuation.resume()
+                    return
+                }
+                self.readyWaiters.append(continuation)
+                self.queue.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                    self?.flushReadyWaiters()
+                }
+            }
         }
     }
 
@@ -31,8 +53,13 @@ final class LocalStreamProxy {
     // MARK: - Listener Setup
 
     private func ensureListenerRunning() {
-        if let listener, listener.state == .ready || listener.state == .setup {
-            return
+        if let listener {
+            switch listener.state {
+            case .ready, .setup:
+                return
+            default:
+                break
+            }
         }
 
         listener?.cancel()
@@ -47,8 +74,15 @@ final class LocalStreamProxy {
         do {
             let newListener = try NWListener(using: parameters)
             newListener.stateUpdateHandler = { [weak self] state in
-                if case .failed = state {
-                    self?.listener = nil
+                guard let self else { return }
+                switch state {
+                case .ready:
+                    self.flushReadyWaiters()
+                case .failed, .cancelled:
+                    self.listener = nil
+                    self.flushReadyWaiters()
+                default:
+                    break
                 }
             }
             newListener.newConnectionHandler = { [weak self] connection in
@@ -58,6 +92,15 @@ final class LocalStreamProxy {
             self.listener = newListener
         } catch {
             self.listener = nil
+            flushReadyWaiters()
+        }
+    }
+
+    private func flushReadyWaiters() {
+        let waiters = readyWaiters
+        readyWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
         }
     }
 
@@ -69,20 +112,26 @@ final class LocalStreamProxy {
 
 // MARK: - Per-Connection Streaming Handler
 
-private final class ProxyConnectionHandler: NSObject, URLSessionDataDelegate {
+private final class ProxyConnectionHandler: NSObject, URLSessionDataDelegate, URLSessionTaskDelegate {
     private let connection: NWConnection
     private weak var authManager: AuthManager?
     private let queue: DispatchQueue
+
+    private let highWaterMark = 2 * 1024 * 1024
+    private let lowWaterMark = 512 * 1024
 
     private var requestBuffer = Data()
     private var activeTask: URLSessionDataTask?
     private var urlSession: URLSession?
     private var isCancelled = false
     private var didRetryAuth = false
+    private var inFlightBytes = 0
+    private var isTaskSuspended = false
 
     private var requestMethod = "GET"
     private var targetFileId = ""
     private var clientRangeHeader: String?
+    private var currentAccessToken = ""
 
     init(connection: NWConnection, authManager: AuthManager?, queue: DispatchQueue) {
         self.connection = connection
@@ -146,8 +195,11 @@ private final class ProxyConnectionHandler: NSObject, URLSessionDataDelegate {
 
         requestMethod = String(parts[0]).uppercased()
         let rawTarget = String(parts[1])
+        let normalizedTarget = rawTarget.hasPrefix("http://") || rawTarget.hasPrefix("https://")
+            ? rawTarget
+            : "http://127.0.0.1" + rawTarget
 
-        guard let components = URLComponents(string: "http://127.0.0.1" + rawTarget),
+        guard let components = URLComponents(string: normalizedTarget),
               components.path == "/stream",
               let fileId = components.queryItems?.first(where: { $0.name == "fileId" })?.value,
               !fileId.isEmpty else {
@@ -199,9 +251,14 @@ private final class ProxyConnectionHandler: NSObject, URLSessionDataDelegate {
             return
         }
 
+        currentAccessToken = accessToken
+        inFlightBytes = 0
+        isTaskSuspended = false
+
         var request = URLRequest(url: url)
         request.httpMethod = requestMethod == "HEAD" ? "HEAD" : "GET"
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         if let range = clientRangeHeader {
             request.setValue(range, forHTTPHeaderField: "Range")
         }
@@ -211,6 +268,7 @@ private final class ProxyConnectionHandler: NSObject, URLSessionDataDelegate {
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.timeoutIntervalForRequest = 60
         config.timeoutIntervalForResource = 0
+        config.httpAdditionalHeaders = ["Accept-Encoding": "identity"]
 
         let delegateQueue = OperationQueue()
         delegateQueue.underlyingQueue = queue
@@ -224,7 +282,26 @@ private final class ProxyConnectionHandler: NSObject, URLSessionDataDelegate {
         task.resume()
     }
 
-    // MARK: - URLSessionDataDelegate
+    // MARK: - URLSessionTaskDelegate & URLSessionDataDelegate
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        var redirected = request
+        if let host = redirected.url?.host?.lowercased(),
+           host.hasSuffix("googleapis.com") || host.hasSuffix("googleusercontent.com") {
+            redirected.setValue("Bearer \(currentAccessToken)", forHTTPHeaderField: "Authorization")
+        }
+        redirected.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        if let range = clientRangeHeader {
+            redirected.setValue(range, forHTTPHeaderField: "Range")
+        }
+        completionHandler(redirected)
+    }
 
     func urlSession(
         _ session: URLSession,
@@ -248,8 +325,13 @@ private final class ProxyConnectionHandler: NSObject, URLSessionDataDelegate {
             return
         }
 
-        let reason = HTTPURLResponse.localizedString(forStatusCode: http.statusCode).capitalized
-        var headerText = "HTTP/1.1 \(http.statusCode) \(reason)\r\n"
+        let statusText: String
+        switch http.statusCode {
+        case 200: statusText = "OK"
+        case 206: statusText = "Partial Content"
+        default: statusText = HTTPURLResponse.localizedString(forStatusCode: http.statusCode).capitalized
+        }
+        var headerText = "HTTP/1.1 \(http.statusCode) \(statusText)\r\n"
 
         let forwardKeys = ["content-type", "content-length", "content-range", "accept-ranges", "etag", "last-modified"]
         var hasAcceptRanges = false
@@ -280,9 +362,25 @@ private final class ProxyConnectionHandler: NSObject, URLSessionDataDelegate {
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         guard !isCancelled, !data.isEmpty else { return }
+
+        let chunkSize = data.count
+        inFlightBytes += chunkSize
+        if inFlightBytes >= highWaterMark && !isTaskSuspended {
+            isTaskSuspended = true
+            dataTask.suspend()
+        }
+
         connection.send(content: data, completion: .contentProcessed { [weak self] error in
-            if error != nil {
-                self?.teardown()
+            guard let self else { return }
+            if let error {
+                _ = error
+                self.teardown()
+                return
+            }
+            self.inFlightBytes = max(0, self.inFlightBytes - chunkSize)
+            if self.isTaskSuspended && self.inFlightBytes <= self.lowWaterMark && !self.isCancelled {
+                self.isTaskSuspended = false
+                self.activeTask?.resume()
             }
         })
     }

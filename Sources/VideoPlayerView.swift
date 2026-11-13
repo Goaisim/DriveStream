@@ -139,6 +139,7 @@ private final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPla
 
     private let fileId: String
     private var didAttemptResume = false
+    private var didStartPlayback = false
     private var didStop = false
     private var lastSavedAt: Date = .distantPast
 
@@ -149,6 +150,9 @@ private final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPla
     }
 
     func start(url: URL, drawable: UIView) {
+        guard !didStartPlayback else { return }
+        didStartPlayback = true
+
         do {
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
             try AVAudioSession.sharedInstance().setActive(true)
@@ -255,7 +259,15 @@ private final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPla
             guard let self else { return }
             let state = self.mediaPlayer.state
             self.isPlaying = self.mediaPlayer.isPlaying
-            self.isBuffering = (state == .opening || state == .buffering)
+            if state == .opening {
+                self.isBuffering = true
+            } else if state == .buffering {
+                if !self.mediaPlayer.isPlaying && self.currentTime == 0 {
+                    self.isBuffering = true
+                }
+            } else {
+                self.isBuffering = false
+            }
 
             if state == .playing || state == .paused {
                 self.syncTimeState()
@@ -284,14 +296,27 @@ private final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPla
     }
 }
 
+private final class VLCDrawableUIView: UIView {
+    var onMountedInWindow: ((UIView) -> Void)?
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window != nil {
+            onMountedInWindow?(self)
+        }
+    }
+}
+
 private struct VLCVideoSurface: UIViewRepresentable {
     let controller: VLCPlayerController
     let streamURL: URL
 
     func makeUIView(context: Context) -> UIView {
-        let view = UIView()
+        let view = VLCDrawableUIView()
         view.backgroundColor = .black
-        controller.start(url: streamURL, drawable: view)
+        view.onMountedInWindow = { [weak controller] mountedView in
+            controller?.start(url: streamURL, drawable: mountedView)
+        }
         return view
     }
 

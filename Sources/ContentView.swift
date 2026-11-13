@@ -71,11 +71,23 @@ final class LibraryViewModel: ObservableObject {
     private var loadGeneration = 0
 
     var showGroups: [ShowGroup] {
-        let grouped = Dictionary(grouping: items) { item in
-            TMDBService.shared.normalizedShowKey(item.parsed.title)
+        let validItems = items.filter { !$0.file.isFolder }
+        let nonSeasonShowKeys = Set(
+            validItems
+                .filter { !TMDBService.shared.isSeasonOnlyTitle($0.showTitle) }
+                .map { TMDBService.shared.normalizedShowKey($0.parsed.title) }
+        )
+        let soleShowKey = nonSeasonShowKeys.count == 1 ? nonSeasonShowKeys.first : nil
+
+        let grouped = Dictionary(grouping: validItems) { item -> String in
+            let key = TMDBService.shared.normalizedShowKey(item.parsed.title)
+            if TMDBService.shared.isSeasonOnlyTitle(item.parsed.title), let soleShowKey {
+                return soleShowKey
+            }
+            return key
         }
 
-        return grouped.map { key, groupItems in
+        return grouped.compactMap { key, groupItems -> ShowGroup? in
             let sorted = groupItems.sorted { lhs, rhs in
                 let ls = lhs.parsed.season ?? Int.max
                 let rs = rhs.parsed.season ?? Int.max
@@ -85,8 +97,13 @@ final class LibraryViewModel: ObservableObject {
                 if le != re { return le < re }
                 return lhs.file.name.localizedStandardCompare(rhs.file.name) == .orderedAscending
             }
-            let rawTitle = sorted.first?.parsed.title ?? "Videos"
-            let displayTitle = sorted.first?.showTitle ?? rawTitle
+            let rawTitle = sorted.first(where: { !TMDBService.shared.isSeasonOnlyTitle($0.parsed.title) })?.parsed.title
+                ?? sorted.first?.parsed.title
+                ?? "Videos"
+            let displayTitle = sorted.first(where: { !TMDBService.shared.isSeasonOnlyTitle($0.showTitle) })?.showTitle ?? rawTitle
+            if TMDBService.shared.isSeasonOnlyTitle(displayTitle) {
+                return nil
+            }
             return ShowGroup(
                 id: key.isEmpty ? UUID().uuidString : key,
                 rawTitle: rawTitle,
@@ -148,7 +165,7 @@ final class LibraryViewModel: ObservableObject {
         }
 
         if item.file.prefersVLCPlayer {
-            LocalStreamProxy.shared.start(authManager: authManager)
+            await LocalStreamProxy.shared.ensureReady(authManager: authManager)
             do {
                 _ = try await authManager.validAccessToken()
             } catch {

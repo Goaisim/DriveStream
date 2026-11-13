@@ -19,10 +19,24 @@ struct DriveFile: Identifiable, Codable, Hashable {
     let size: String?
     let thumbnailLink: String?
     let videoMediaMetadata: VideoMediaMetadata?
+    let parents: [String]?
     var folderName: String?
 
     var fileExtension: String {
         (name as NSString).pathExtension.lowercased()
+    }
+
+    var isFolder: Bool {
+        mimeType == "application/vnd.google-apps.folder"
+    }
+
+    var isSupportedVideo: Bool {
+        guard !isFolder else { return false }
+        if mimeType.lowercased().hasPrefix("video/") {
+            return true
+        }
+        let videoExts: Set<String> = ["mp4", "m4v", "mov", "mkv", "avi", "webm", "wmv", "flv", "ts", "m2ts", "mpg", "mpeg", "ogv"]
+        return videoExts.contains(fileExtension)
     }
 
     var prefersVLCPlayer: Bool {
@@ -47,6 +61,12 @@ private struct DriveFileListResponse: Decodable {
     let files: [DriveFile]
 }
 
+private struct DriveNodeMetadata: Decodable {
+    let id: String
+    let name: String
+    let parents: [String]?
+}
+
 final class DriveService {
     private let session: URLSession
 
@@ -56,17 +76,21 @@ final class DriveService {
 
     func fetchVideoFiles(folderID: String?, authManager: AuthManager) async throws -> [DriveFile] {
         let trimmedFolder = folderID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let mediaFilter = "(mimeType contains 'video/' or name contains '.mp4' or name contains '.m4v' or name contains '.mov' or name contains '.mkv' or name contains '.avi')"
+        let mediaFilter = "mimeType != 'application/vnd.google-apps.folder' and (mimeType contains 'video/' or name contains '.mp4' or name contains '.m4v' or name contains '.mov' or name contains '.mkv' or name contains '.avi')"
 
         if trimmedFolder.isEmpty {
             let query = "trashed = false and \(mediaFilter)"
-            return try await listAllPages(query: query, folderName: nil, authManager: authManager)
+            var videos = try await listAllPages(query: query, folderName: nil, authManager: authManager)
+            videos = videos.filter(\.isSupportedVideo)
+            return await populateMissingShowHints(for: videos, authManager: authManager)
         }
+
+        let initialHint = await resolveShowHint(forFolderId: trimmedFolder, authManager: authManager)
 
         // Breadth-first traversal so nested Show/Season folders are all discovered
         var allVideos: [DriveFile] = []
         var visitedFolders: Set<String> = [trimmedFolder]
-        var queue: [(id: String, showHint: String?)] = [(trimmedFolder, nil)]
+        var queue: [(id: String, showHint: String?)] = [(trimmedFolder, initialHint)]
 
         while !queue.isEmpty {
             let current = queue.removeFirst()
@@ -74,7 +98,7 @@ final class DriveService {
 
             let videoQuery = "'\(escapedId)' in parents and trashed = false and \(mediaFilter)"
             let videos = try await listAllPages(query: videoQuery, folderName: current.showHint, authManager: authManager)
-            allVideos.append(contentsOf: videos)
+            allVideos.append(contentsOf: videos.filter(\.isSupportedVideo))
 
             let folderQuery = "'\(escapedId)' in parents and trashed = false and mimeType = 'application/vnd.google-apps.folder'"
             let subfolders = try await listAllPages(query: folderQuery, folderName: nil, authManager: authManager)
@@ -88,6 +112,14 @@ final class DriveService {
         return allVideos
     }
 
+    func makePlayerAsset(for fileId: String, accessToken: String) -> AVURLAsset {
+        let url = URL(string: "https://www.googleapis.com/drive/v3/files/\(fileId)?alt=media")!
+        let headers = ["Authorization": "Bearer \(accessToken)"]
+        return AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
+    }
+
+    // MARK: - Folder & Show Hint Helpers
+
     private func isSeasonFolder(_ name: String) -> Bool {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.range(
@@ -96,10 +128,60 @@ final class DriveService {
         ) != nil
     }
 
-    func makePlayerAsset(for fileId: String, accessToken: String) -> AVURLAsset {
-        let url = URL(string: "https://www.googleapis.com/drive/v3/files/\(fileId)?alt=media")!
-        let headers = ["Authorization": "Bearer \(accessToken)"]
-        return AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
+    private func isGenericRootFolder(_ name: String) -> Bool {
+        let lower = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ["my drive", "drive", "tv", "tv shows", "shows", "series", "videos", "movies", "media"].contains(lower)
+    }
+
+    private func resolveShowHint(forFolderId folderId: String, authManager: AuthManager) async -> String? {
+        var cache: [String: DriveNodeMetadata] = [:]
+        return await resolveNonSeasonAncestor(folderId: folderId, cache: &cache, authManager: authManager)
+    }
+
+    private func populateMissingShowHints(for files: [DriveFile], authManager: AuthManager) async -> [DriveFile] {
+        var cache: [String: DriveNodeMetadata] = [:]
+        var updated = files
+        for idx in updated.indices {
+            guard updated[idx].folderName == nil,
+                  let parentId = updated[idx].parents?.first else { continue }
+            updated[idx].folderName = await resolveNonSeasonAncestor(folderId: parentId, cache: &cache, authManager: authManager)
+        }
+        return updated
+    }
+
+    private func resolveNonSeasonAncestor(
+        folderId: String,
+        cache: inout [String: DriveNodeMetadata],
+        authManager: AuthManager
+    ) async -> String? {
+        var currentId: String? = folderId
+        var depth = 0
+        while let id = currentId, depth < 4 {
+            depth += 1
+            let meta: DriveNodeMetadata?
+            if let cached = cache[id] {
+                meta = cached
+            } else {
+                meta = try? await fetchFolderMetadata(id: id, authManager: authManager)
+                if let meta { cache[id] = meta }
+            }
+            guard let node = meta else { return nil }
+            if !isSeasonFolder(node.name) {
+                return isGenericRootFolder(node.name) ? nil : node.name
+            }
+            currentId = node.parents?.first
+        }
+        return nil
+    }
+
+    private func fetchFolderMetadata(id: String, authManager: AuthManager) async throws -> DriveNodeMetadata {
+        let token = try await authManager.validAccessToken()
+        let url = URL(string: "https://www.googleapis.com/drive/v3/files/\(id)?fields=id,name,parents&supportsAllDrives=true")!
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let (data, response) = try await session.data(for: request)
+        try validate(response: response, data: data)
+        return try JSONDecoder().decode(DriveNodeMetadata.self, from: data)
     }
 
     // MARK: - Private
@@ -141,7 +223,7 @@ final class DriveService {
         var components = URLComponents(string: "https://www.googleapis.com/drive/v3/files")!
         var items = [
             URLQueryItem(name: "q", value: query),
-            URLQueryItem(name: "fields", value: "nextPageToken,files(id,name,mimeType,size,thumbnailLink,videoMediaMetadata)"),
+            URLQueryItem(name: "fields", value: "nextPageToken,files(id,name,mimeType,size,thumbnailLink,videoMediaMetadata,parents)"),
             URLQueryItem(name: "pageSize", value: "200"),
             URLQueryItem(name: "supportsAllDrives", value: "true"),
             URLQueryItem(name: "includeItemsFromAllDrives", value: "true"),

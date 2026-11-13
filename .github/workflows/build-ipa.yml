@@ -16,18 +16,11 @@ jobs:
 
       - name: Download MobileVLCKit
         run: |
-          VLC_URL=$(curl -sSL https://trunk.cocoapods.org/api/v1/pods/MobileVLCKit/specs/3.7.5 | jq -r '.source.http // empty' || true)
-          if [ -z "$VLC_URL" ]; then
-            VLC_URL="https://download.videolan.org/pub/cocoapods/prod/MobileVLCKit-3.7.5-a213fd11-6de05adc.tar.xz"
-          fi
-          curl -fL "$VLC_URL" -o MobileVLCKit.tar.xz
           mkdir -p Frameworks
-          tar -xf MobileVLCKit.tar.xz -C Frameworks
-          XC_PATH=$(find Frameworks -maxdepth 4 -name "MobileVLCKit.xcframework" -type d | head -n 1)
-          if [ -n "$XC_PATH" ] && [ "$XC_PATH" != "Frameworks/MobileVLCKit.xcframework" ]; then
-            mv "$XC_PATH" Frameworks/MobileVLCKit.xcframework
-          fi
-          rm -f MobileVLCKit.tar.xz
+          curl -fL "https://download.videolan.org/pub/cocoapods/prod/MobileVLCKit-3.6.0-c73b779f-dd8bfdba.tar.xz" -o MobileVLCKit.tar.xz
+          tar -xf MobileVLCKit.tar.xz
+          mv MobileVLCKit-binary/MobileVLCKit.xcframework Frameworks/MobileVLCKit.xcframework
+          rm -rf MobileVLCKit.tar.xz MobileVLCKit-binary
           ls -la Frameworks/MobileVLCKit.xcframework
 
       - name: Generate Xcode project
