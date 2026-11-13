@@ -23,8 +23,9 @@ jobs:
           rm -rf MobileVLCKit.tar.xz MobileVLCKit-binary
           ls -la Frameworks/MobileVLCKit.xcframework
 
-      - name: Generate Xcode project
+      - name: Generate App Icon & Xcode project
         run: |
+          python3 scripts/generate_icon.py
           command -v xcodegen >/dev/null 2>&1 || brew install xcodegen
           xcodegen generate
 

@@ -4,6 +4,16 @@ import MobileVLCKit
 import SwiftUI
 import UIKit
 
+struct PlayerEpisode: Identifiable, Hashable {
+    let id: String
+    let title: String
+    let shortTitle: String
+    let subtitle: String?
+    let episodeCode: String?
+    let stillURL: URL?
+    let prefersVLC: Bool
+}
+
 struct PlaybackProgress: Codable, Hashable {
     let fileId: String
     let position: TimeInterval
@@ -83,8 +93,8 @@ enum PlaybackEngine {
 }
 
 struct VideoPlayerView: View {
-    let fileId: String
-    let title: String
+    let episodes: [PlayerEpisode]
+    let initialEpisode: PlayerEpisode
     let engine: PlaybackEngine
 
     @Environment(\.dismiss) private var dismiss
@@ -92,13 +102,13 @@ struct VideoPlayerView: View {
     var body: some View {
         switch engine {
         case .vlc:
-            VLCPlayerContainerView(fileId: fileId, title: title) {
+            VLCPlayerContainerView(episodes: episodes, initialEpisode: initialEpisode) {
                 dismiss()
             }
         case .avPlayer(let asset):
             ZStack(alignment: .topLeading) {
                 Color.black.ignoresSafeArea()
-                AVPlayerViewControllerWrapper(fileId: fileId, asset: asset)
+                AVPlayerViewControllerWrapper(fileId: initialEpisode.id, asset: asset)
                     .ignoresSafeArea()
                 Button {
                     dismiss()
@@ -116,6 +126,31 @@ struct VideoPlayerView: View {
     }
 }
 
+// MARK: - Non-Interactive Video Surface
+
+private final class NonInteractiveVideoSurfaceView: UIView {
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        configure()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configure()
+    }
+
+    override func didAddSubview(_ subview: UIView) {
+        super.didAddSubview(subview)
+        subview.isUserInteractionEnabled = false
+    }
+
+    private func configure() {
+        isUserInteractionEnabled = false
+        backgroundColor = .black
+        autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    }
+}
+
 // MARK: - MobileVLCKit ViewModel & Player
 
 private struct VLCTrackOption: Identifiable, Hashable {
@@ -126,13 +161,10 @@ private struct VLCTrackOption: Identifiable, Hashable {
 @MainActor
 private final class VLCPlayerViewModel: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     let player = VLCMediaPlayer()
-    let videoSurfaceView: UIView = {
-        let view = UIView()
-        view.backgroundColor = .black
-        view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        return view
-    }()
+    let videoSurfaceView = NonInteractiveVideoSurfaceView()
 
+    @Published var episodes: [PlayerEpisode]
+    @Published var currentEpisode: PlayerEpisode
     @Published var isLoading = true
     @Published var isPlaying = false
     @Published var currentTime: TimeInterval = 0
@@ -144,14 +176,39 @@ private final class VLCPlayerViewModel: NSObject, ObservableObject, VLCMediaPlay
     @Published var vlcStateString = "Initializing…"
     @Published var errorMessage: String?
 
-    private let fileId: String
     private var didStartPlayback = false
     private var didAttemptResume = false
+    private var didApplyInitialSubtitleSetting = false
+    private var userToggledSubtitles = false
     private var didStop = false
     private var lastSavedAt: Date = .distantPast
+    private var seekIgnoreUntil: Date = .distantPast
 
-    init(fileId: String) {
-        self.fileId = fileId
+    var currentEpisodeIndex: Int? {
+        episodes.firstIndex(where: { $0.id == currentEpisode.id })
+    }
+
+    var hasPreviousEpisode: Bool {
+        guard let idx = currentEpisodeIndex else { return false }
+        return idx > 0
+    }
+
+    var hasNextEpisode: Bool {
+        guard let idx = currentEpisodeIndex else { return false }
+        return idx + 1 < episodes.count
+    }
+
+    var selectableSubtitles: [VLCTrackOption] {
+        subtitleTracks.filter { $0.id != -1 }
+    }
+
+    var hasActiveSubtitles: Bool {
+        currentSubtitleTrackIndex != -1
+    }
+
+    init(episodes: [PlayerEpisode], initialEpisode: PlayerEpisode) {
+        self.episodes = episodes.isEmpty ? [initialEpisode] : episodes
+        self.currentEpisode = initialEpisode
         super.init()
         player.drawable = videoSurfaceView
         player.delegate = self
@@ -160,6 +217,7 @@ private final class VLCPlayerViewModel: NSObject, ObservableObject, VLCMediaPlay
     func startPlayback() async {
         guard !didStartPlayback else { return }
         didStartPlayback = true
+        didStop = false
 
         do {
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
@@ -179,7 +237,7 @@ private final class VLCPlayerViewModel: NSObject, ObservableObject, VLCMediaPlay
 
         vlcStateString = "Starting proxy :8765…"
         let port = await LocalStreamProxy.shared.ensureReady()
-        guard let proxyURL = LocalStreamProxy.shared.streamURL(for: fileId, port: port) else {
+        guard let proxyURL = LocalStreamProxy.shared.streamURL(for: currentEpisode.id, port: port) else {
             isLoading = false
             errorMessage = "Could not construct stream URL."
             return
@@ -194,6 +252,45 @@ private final class VLCPlayerViewModel: NSObject, ObservableObject, VLCMediaPlay
         player.play()
     }
 
+    func switchToPreviousEpisode() {
+        guard let idx = currentEpisodeIndex, idx > 0 else { return }
+        switchToEpisode(episodes[idx - 1])
+    }
+
+    func switchToNextEpisode() {
+        guard let idx = currentEpisodeIndex, idx + 1 < episodes.count else { return }
+        switchToEpisode(episodes[idx + 1])
+    }
+
+    func switchToEpisode(_ episode: PlayerEpisode) {
+        guard episode.id != currentEpisode.id else { return }
+
+        saveProgress(force: true)
+        player.delegate = nil
+        player.stop()
+
+        currentEpisode = episode
+        didStartPlayback = false
+        didAttemptResume = false
+        didApplyInitialSubtitleSetting = false
+        userToggledSubtitles = false
+        isLoading = true
+        isPlaying = false
+        currentTime = 0
+        duration = 0
+        audioTracks = []
+        subtitleTracks = []
+        currentAudioTrackIndex = -1
+        currentSubtitleTrackIndex = -1
+        errorMessage = nil
+        seekIgnoreUntil = .distantPast
+        vlcStateString = "Switching episode…"
+
+        Task { [weak self] in
+            await self?.startPlayback()
+        }
+    }
+
     func togglePlayPause() {
         if player.isPlaying {
             player.pause()
@@ -203,20 +300,23 @@ private final class VLCPlayerViewModel: NSObject, ObservableObject, VLCMediaPlay
         isPlaying = player.isPlaying
     }
 
-    func skip(seconds: Int32) {
-        if seconds >= 0 {
-            player.jumpForward(seconds)
-        } else {
-            player.jumpBackward(-seconds)
-        }
-        syncTimeState()
+    func skip(seconds: Double) {
+        seek(to: currentTime + seconds)
     }
 
-    func seek(to seconds: TimeInterval) {
-        guard seconds.isFinite, seconds >= 0 else { return }
-        let clampedMs = Int32(min(seconds * 1000.0, Double(Int32.max - 1)))
-        player.time = VLCTime(int: clampedMs)
-        currentTime = seconds
+    func seek(to targetSeconds: TimeInterval) {
+        guard targetSeconds.isFinite else { return }
+        let upperBound = duration > 0 ? duration : max(targetSeconds, currentTime)
+        let target = min(max(targetSeconds, 0), upperBound)
+
+        seekIgnoreUntil = Date().addingTimeInterval(1.2)
+        currentTime = target
+
+        let targetMs = Int32(min(target * 1000.0, Double(Int32.max - 1)))
+        if duration > 0 {
+            player.position = Float(target / duration)
+        }
+        player.time = VLCTime(int: targetMs)
     }
 
     func selectAudioTrack(_ index: Int32) {
@@ -225,8 +325,15 @@ private final class VLCPlayerViewModel: NSObject, ObservableObject, VLCMediaPlay
     }
 
     func selectSubtitleTrack(_ index: Int32) {
+        userToggledSubtitles = true
         player.currentVideoSubTitleIndex = index
         currentSubtitleTrackIndex = index
+    }
+
+    func disableSubtitles() {
+        userToggledSubtitles = true
+        player.currentVideoSubTitleIndex = -1
+        currentSubtitleTrackIndex = -1
     }
 
     func refreshTracks() {
@@ -238,7 +345,15 @@ private final class VLCPlayerViewModel: NSObject, ObservableObject, VLCMediaPlay
         let sNames = player.videoSubTitlesNames.compactMap { $0 as? String }
         let sIndexes = player.videoSubTitlesIndexes.compactMap { ($0 as? NSNumber)?.int32Value }
         subtitleTracks = zip(sIndexes, sNames).map { VLCTrackOption(id: $0.0, name: $0.1) }
-        currentSubtitleTrackIndex = player.currentVideoSubTitleIndex
+
+        if !userToggledSubtitles {
+            if player.currentVideoSubTitleIndex != -1 {
+                player.currentVideoSubTitleIndex = -1
+            }
+            currentSubtitleTrackIndex = -1
+        } else {
+            currentSubtitleTrackIndex = player.currentVideoSubTitleIndex
+        }
     }
 
     func stopAndSave() {
@@ -250,9 +365,18 @@ private final class VLCPlayerViewModel: NSObject, ObservableObject, VLCMediaPlay
         player.drawable = nil
     }
 
+    private func applyInitialSubtitleOffIfNeeded() {
+        guard !didApplyInitialSubtitleSetting, !userToggledSubtitles else { return }
+        didApplyInitialSubtitleSetting = true
+        player.currentVideoSubTitleIndex = -1
+        currentSubtitleTrackIndex = -1
+    }
+
     private func syncTimeState() {
-        let timeMs = max(player.time.intValue, 0)
-        currentTime = Double(timeMs) / 1000.0
+        if Date() >= seekIgnoreUntil {
+            let timeMs = max(player.time.intValue, 0)
+            currentTime = Double(timeMs) / 1000.0
+        }
 
         let lengthMs = player.media?.length.intValue ?? 0
         if lengthMs > 0 {
@@ -263,7 +387,7 @@ private final class VLCPlayerViewModel: NSObject, ObservableObject, VLCMediaPlay
     private func attemptResumeIfNeeded() {
         guard !didAttemptResume, duration > 0 else { return }
         didAttemptResume = true
-        if let saved = PlaybackStore.shared.progress(for: fileId),
+        if let saved = PlaybackStore.shared.progress(for: currentEpisode.id),
            saved.position > 1,
            saved.position / duration < 0.95 {
             seek(to: saved.position)
@@ -277,7 +401,7 @@ private final class VLCPlayerViewModel: NSObject, ObservableObject, VLCMediaPlay
             return
         }
         lastSavedAt = now
-        PlaybackStore.shared.save(fileId: fileId, position: currentTime, duration: duration)
+        PlaybackStore.shared.save(fileId: currentEpisode.id, position: currentTime, duration: duration)
     }
 
     private func stateLabel(for state: VLCMediaPlayerState) -> String {
@@ -304,6 +428,7 @@ private final class VLCPlayerViewModel: NSObject, ObservableObject, VLCMediaPlay
 
             if state == .playing || state == .paused {
                 self.isLoading = false
+                self.applyInitialSubtitleOffIfNeeded()
                 self.syncTimeState()
                 self.refreshTracks()
                 self.attemptResumeIfNeeded()
@@ -323,10 +448,10 @@ private final class VLCPlayerViewModel: NSObject, ObservableObject, VLCMediaPlay
             if self.player.isPlaying || self.player.time.intValue > 0 {
                 self.isLoading = false
                 self.isPlaying = true
-                self.currentTime = Double(max(self.player.time.intValue, 0)) / 1000.0
-                self.duration = Double(max(self.player.media?.length.intValue ?? 0, 0)) / 1000.0
+                self.applyInitialSubtitleOffIfNeeded()
+                self.syncTimeState()
             }
-            if self.audioTracks.isEmpty {
+            if self.audioTracks.isEmpty || self.subtitleTracks.isEmpty {
                 self.refreshTracks()
             }
             self.attemptResumeIfNeeded()
@@ -336,18 +461,16 @@ private final class VLCPlayerViewModel: NSObject, ObservableObject, VLCMediaPlay
 }
 
 private struct VLCVideoSurfaceView: UIViewRepresentable {
-    let surfaceView: UIView
+    let surfaceView: NonInteractiveVideoSurfaceView
 
-    func makeUIView(context: Context) -> UIView {
+    func makeUIView(context: Context) -> NonInteractiveVideoSurfaceView {
         surfaceView
     }
 
-    func updateUIView(_ uiView: UIView, context: Context) {}
+    func updateUIView(_ uiView: NonInteractiveVideoSurfaceView, context: Context) {}
 }
 
 private struct VLCPlayerContainerView: View {
-    let fileId: String
-    let title: String
     let onClose: () -> Void
 
     @StateObject private var viewModel: VLCPlayerViewModel
@@ -357,13 +480,14 @@ private struct VLCPlayerContainerView: View {
     @State private var isScrubbing = false
     @State private var scrubPosition: TimeInterval = 0
     @State private var isLandscape = false
+    @State private var showEpisodeDrawer = false
+    @State private var showSubtitleDialog = false
+    @State private var doubleTapFeedback: String?
     @State private var hideTask: Task<Void, Never>?
 
-    init(fileId: String, title: String, onClose: @escaping () -> Void) {
-        self.fileId = fileId
-        self.title = title
+    init(episodes: [PlayerEpisode], initialEpisode: PlayerEpisode, onClose: @escaping () -> Void) {
         self.onClose = onClose
-        _viewModel = StateObject(wrappedValue: VLCPlayerViewModel(fileId: fileId))
+        _viewModel = StateObject(wrappedValue: VLCPlayerViewModel(episodes: episodes, initialEpisode: initialEpisode))
     }
 
     var body: some View {
@@ -372,13 +496,39 @@ private struct VLCPlayerContainerView: View {
 
             VLCVideoSurfaceView(surfaceView: viewModel.videoSurfaceView)
                 .ignoresSafeArea()
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        showControls.toggle()
+
+            // Full-screen transparent touch layer above VLC surface and below controls
+            HStack(spacing: 0) {
+                Color.white.opacity(0.001)
+                    .contentShape(Rectangle())
+                    .onTapGesture(count: 2) {
+                        performDoubleTapSkip(-10)
                     }
-                    scheduleAutoHide()
-                }
+                    .onTapGesture(count: 1) {
+                        toggleControlsVisibility()
+                    }
+
+                Color.white.opacity(0.001)
+                    .contentShape(Rectangle())
+                    .onTapGesture(count: 2) {
+                        performDoubleTapSkip(10)
+                    }
+                    .onTapGesture(count: 1) {
+                        toggleControlsVisibility()
+                    }
+            }
+            .ignoresSafeArea()
+
+            if let doubleTapFeedback {
+                Text(doubleTapFeedback)
+                    .font(.headline.bold())
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 10)
+                    .background(.black.opacity(0.75))
+                    .clipShape(Capsule())
+                    .allowsHitTesting(false)
+            }
 
             if viewModel.isLoading && viewModel.errorMessage == nil {
                 VStack(spacing: 12) {
@@ -398,6 +548,7 @@ private struct VLCPlayerContainerView: View {
                 .background(.black.opacity(0.7))
                 .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                 .padding(.horizontal, 24)
+                .allowsHitTesting(false)
             }
 
             if let error = viewModel.errorMessage {
@@ -422,14 +573,48 @@ private struct VLCPlayerContainerView: View {
                 controlsOverlay
                     .transition(.opacity)
             }
+
+            if showEpisodeDrawer {
+                episodeDrawerOverlay
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
         }
         .statusBarHidden(true)
+        .confirmationDialog("Subtitles", isPresented: $showSubtitleDialog, titleVisibility: .visible) {
+            Button("Off") {
+                viewModel.disableSubtitles()
+                scheduleAutoHide()
+            }
+            ForEach(viewModel.selectableSubtitles) { track in
+                Button(track.id == viewModel.currentSubtitleTrackIndex ? "✓ \(track.name)" : track.name) {
+                    viewModel.selectSubtitleTrack(track.id)
+                    scheduleAutoHide()
+                }
+            }
+            Button("Cancel", role: .cancel) {
+                scheduleAutoHide()
+            }
+        }
+        .onChange(of: showEpisodeDrawer) { _, isOpen in
+            if isOpen {
+                cancelAutoHide()
+            } else {
+                scheduleAutoHide()
+            }
+        }
+        .onChange(of: showSubtitleDialog) { _, isOpen in
+            if isOpen {
+                cancelAutoHide()
+            } else {
+                scheduleAutoHide()
+            }
+        }
         .task {
             scheduleAutoHide()
             await viewModel.startPlayback()
         }
         .onDisappear {
-            hideTask?.cancel()
+            cancelAutoHide()
             viewModel.stopAndSave()
             resetOrientation()
         }
@@ -438,7 +623,7 @@ private struct VLCPlayerContainerView: View {
     private var controlsOverlay: some View {
         VStack {
             // Top bar
-            HStack(spacing: 12) {
+            HStack(spacing: 10) {
                 Button(action: closePlayer) {
                     Image(systemName: "xmark")
                         .font(.headline)
@@ -448,18 +633,35 @@ private struct VLCPlayerContainerView: View {
                         .clipShape(Circle())
                 }
 
-                Text(title)
+                Text(viewModel.currentEpisode.title)
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.white)
                     .lineLimit(1)
 
                 Spacer()
 
+                if viewModel.episodes.count > 1 {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.22)) {
+                            showEpisodeDrawer.toggle()
+                        }
+                    } label: {
+                        Image(systemName: "list.and.film")
+                            .font(.subheadline)
+                            .foregroundStyle(.white)
+                            .padding(10)
+                            .background(showEpisodeDrawer ? Color.blue : .black.opacity(0.55))
+                            .clipShape(Circle())
+                    }
+                    .accessibilityLabel("Episodes")
+                }
+
                 if !viewModel.audioTracks.isEmpty {
                     Menu {
                         ForEach(viewModel.audioTracks) { track in
                             Button {
                                 viewModel.selectAudioTrack(track.id)
+                                scheduleAutoHide()
                             } label: {
                                 if track.id == viewModel.currentAudioTrackIndex {
                                     Label(track.name, systemImage: "checkmark")
@@ -478,11 +680,26 @@ private struct VLCPlayerContainerView: View {
                     }
                 }
 
-                if !viewModel.subtitleTracks.isEmpty {
-                    Menu {
-                        ForEach(viewModel.subtitleTracks) { track in
+                if !viewModel.selectableSubtitles.isEmpty {
+                    Button {
+                        handleCCTap()
+                    } label: {
+                        Image(systemName: viewModel.hasActiveSubtitles ? "captions.bubble.fill" : "captions.bubble")
+                            .font(.subheadline)
+                            .foregroundStyle(.white)
+                            .padding(10)
+                            .background(viewModel.hasActiveSubtitles ? Color.blue : .black.opacity(0.55))
+                            .clipShape(Circle())
+                    }
+                    .contextMenu {
+                        Button("Off") {
+                            viewModel.disableSubtitles()
+                            scheduleAutoHide()
+                        }
+                        ForEach(viewModel.selectableSubtitles) { track in
                             Button {
                                 viewModel.selectSubtitleTrack(track.id)
+                                scheduleAutoHide()
                             } label: {
                                 if track.id == viewModel.currentSubtitleTrackIndex {
                                     Label(track.name, systemImage: "checkmark")
@@ -491,13 +708,6 @@ private struct VLCPlayerContainerView: View {
                                 }
                             }
                         }
-                    } label: {
-                        Image(systemName: "captions.bubble.fill")
-                            .font(.subheadline)
-                            .foregroundStyle(.white)
-                            .padding(10)
-                            .background(.black.opacity(0.55))
-                            .clipShape(Circle())
                     }
                 }
 
@@ -516,13 +726,28 @@ private struct VLCPlayerContainerView: View {
             Spacer()
 
             // Center playback controls
-            HStack(spacing: 44) {
+            HStack(spacing: 26) {
+                if viewModel.episodes.count > 1 {
+                    Button {
+                        viewModel.switchToPreviousEpisode()
+                        scheduleAutoHide()
+                    } label: {
+                        Image(systemName: "backward.end.fill")
+                            .font(.system(size: 22, weight: .semibold))
+                            .foregroundStyle(viewModel.hasPreviousEpisode ? .white : .white.opacity(0.35))
+                            .padding(12)
+                            .background(.black.opacity(0.45))
+                            .clipShape(Circle())
+                    }
+                    .disabled(!viewModel.hasPreviousEpisode)
+                }
+
                 Button {
                     viewModel.skip(seconds: -10)
                     scheduleAutoHide()
                 } label: {
                     Image(systemName: "gobackward.10")
-                        .font(.system(size: 30, weight: .medium))
+                        .font(.system(size: 28, weight: .medium))
                         .foregroundStyle(.white)
                         .padding(14)
                         .background(.black.opacity(0.45))
@@ -534,7 +759,7 @@ private struct VLCPlayerContainerView: View {
                     scheduleAutoHide()
                 } label: {
                     Image(systemName: viewModel.isPlaying ? "pause.fill" : "play.fill")
-                        .font(.system(size: 38, weight: .bold))
+                        .font(.system(size: 36, weight: .bold))
                         .foregroundStyle(.white)
                         .padding(20)
                         .background(.black.opacity(0.55))
@@ -546,11 +771,26 @@ private struct VLCPlayerContainerView: View {
                     scheduleAutoHide()
                 } label: {
                     Image(systemName: "goforward.10")
-                        .font(.system(size: 30, weight: .medium))
+                        .font(.system(size: 28, weight: .medium))
                         .foregroundStyle(.white)
                         .padding(14)
                         .background(.black.opacity(0.45))
                         .clipShape(Circle())
+                }
+
+                if viewModel.episodes.count > 1 {
+                    Button {
+                        viewModel.switchToNextEpisode()
+                        scheduleAutoHide()
+                    } label: {
+                        Image(systemName: "forward.end.fill")
+                            .font(.system(size: 22, weight: .semibold))
+                            .foregroundStyle(viewModel.hasNextEpisode ? .white : .white.opacity(0.35))
+                            .padding(12)
+                            .background(.black.opacity(0.45))
+                            .clipShape(Circle())
+                    }
+                    .disabled(!viewModel.hasNextEpisode)
                 }
             }
 
@@ -568,11 +808,12 @@ private struct VLCPlayerContainerView: View {
                     in: 0...max(viewModel.duration, 1),
                     onEditingChanged: { editing in
                         isScrubbing = editing
-                        if !editing {
+                        if editing {
+                            scrubPosition = viewModel.currentTime
+                            cancelAutoHide()
+                        } else {
                             viewModel.seek(to: scrubPosition)
                             scheduleAutoHide()
-                        } else {
-                            hideTask?.cancel()
                         }
                     }
                 )
@@ -605,22 +846,156 @@ private struct VLCPlayerContainerView: View {
                 endPoint: .bottom
             )
             .ignoresSafeArea()
+            .allowsHitTesting(false)
         )
     }
 
+    private var episodeDrawerOverlay: some View {
+        ZStack(alignment: .trailing) {
+            Color.black.opacity(0.45)
+                .ignoresSafeArea()
+                .onTapGesture {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        showEpisodeDrawer = false
+                    }
+                }
+
+            VStack(alignment: .leading, spacing: 0) {
+                HStack {
+                    Text("Episodes")
+                        .font(.headline)
+                        .foregroundStyle(.white)
+                    Spacer()
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            showEpisodeDrawer = false
+                        }
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.title3)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(16)
+
+                Divider()
+
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 8) {
+                            ForEach(viewModel.episodes) { ep in
+                                let isCurrent = ep.id == viewModel.currentEpisode.id
+                                Button {
+                                    withAnimation(.easeInOut(duration: 0.2)) {
+                                        showEpisodeDrawer = false
+                                    }
+                                    viewModel.switchToEpisode(ep)
+                                } label: {
+                                    HStack(spacing: 10) {
+                                        Image(systemName: isCurrent ? "speaker.wave.2.fill" : "play.circle")
+                                            .foregroundStyle(isCurrent ? .blue : .secondary)
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(ep.shortTitle)
+                                                .font(.subheadline.weight(isCurrent ? .bold : .medium))
+                                                .foregroundStyle(.white)
+                                                .lineLimit(2)
+                                                .multilineTextAlignment(.leading)
+                                            if let sub = ep.subtitle, !sub.isEmpty {
+                                                Text(sub)
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.secondary)
+                                                    .lineLimit(1)
+                                            }
+                                        }
+                                        Spacer()
+                                    }
+                                    .padding(10)
+                                    .background(isCurrent ? Color.blue.opacity(0.22) : Color.white.opacity(0.06))
+                                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                }
+                                .id(ep.id)
+                            }
+                        }
+                        .padding(12)
+                    }
+                    .onAppear {
+                        proxy.scrollTo(viewModel.currentEpisode.id, anchor: .center)
+                    }
+                }
+            }
+            .frame(width: 300)
+            .background(Color(red: 0.08, green: 0.08, blue: 0.12).opacity(0.96))
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .padding(.vertical, 12)
+            .padding(.trailing, 12)
+        }
+    }
+
+    private func handleCCTap() {
+        let tracks = viewModel.selectableSubtitles
+        if viewModel.hasActiveSubtitles {
+            viewModel.disableSubtitles()
+            scheduleAutoHide()
+        } else if tracks.count == 1 {
+            viewModel.selectSubtitleTrack(tracks[0].id)
+            scheduleAutoHide()
+        } else if tracks.count > 1 {
+            showSubtitleDialog = true
+        }
+    }
+
+    private func toggleControlsVisibility() {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            showControls.toggle()
+        }
+        if showControls {
+            scheduleAutoHide()
+        } else {
+            cancelAutoHide()
+        }
+    }
+
+    private func performDoubleTapSkip(_ delta: Double) {
+        viewModel.skip(seconds: delta)
+        let label = delta < 0 ? "-10s" : "+10s"
+        withAnimation(.easeOut(duration: 0.15)) {
+            doubleTapFeedback = label
+        }
+        if showControls {
+            scheduleAutoHide()
+        }
+        Task {
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            await MainActor.run {
+                if doubleTapFeedback == label {
+                    withAnimation(.easeIn(duration: 0.2)) {
+                        doubleTapFeedback = nil
+                    }
+                }
+            }
+        }
+    }
+
     private func closePlayer() {
+        cancelAutoHide()
         viewModel.stopAndSave()
         resetOrientation()
         onClose()
     }
 
-    private func scheduleAutoHide() {
+    private func cancelAutoHide() {
         hideTask?.cancel()
+        hideTask = nil
+    }
+
+    private func scheduleAutoHide() {
+        cancelAutoHide()
+        guard !isScrubbing && !showEpisodeDrawer && !showSubtitleDialog else { return }
         hideTask = Task {
             try? await Task.sleep(nanoseconds: 4_000_000_000)
             guard !Task.isCancelled else { return }
             await MainActor.run {
-                if viewModel.isPlaying && !isScrubbing {
+                if viewModel.isPlaying && !isScrubbing && !showEpisodeDrawer && !showSubtitleDialog {
                     withAnimation(.easeInOut(duration: 0.25)) {
                         showControls = false
                     }

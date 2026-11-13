@@ -57,7 +57,8 @@ struct ShowGroup: Identifiable, Hashable {
 
 struct ActivePlayback: Identifiable {
     let id: String
-    let title: String
+    let episodes: [PlayerEpisode]
+    let initialEpisode: PlayerEpisode
     let engine: PlaybackEngine
 }
 
@@ -154,7 +155,40 @@ final class LibraryViewModel: ObservableObject {
         await enrichMetadata(for: items, generation: generation)
     }
 
-    func makePlayback(for item: MediaItem, authManager: AuthManager) async -> ActivePlayback? {
+    func makePlayback(for item: MediaItem, in orderedItems: [MediaItem]? = nil, authManager: AuthManager) async -> ActivePlayback? {
+        let queueSource = orderedItems ?? showGroups.first(where: { group in
+            group.items.contains(where: { $0.id == item.id })
+        })?.items ?? [item]
+
+        let episodes = queueSource.map(playerEpisode(from:))
+        let targetId = item.file.effectiveId
+        let initial = episodes.first(where: { $0.id == targetId }) ?? playerEpisode(from: item)
+
+        if item.file.prefersVLCPlayer {
+            return ActivePlayback(
+                id: targetId,
+                episodes: episodes,
+                initialEpisode: initial,
+                engine: .vlc
+            )
+        }
+
+        do {
+            let token = try await authManager.validAccessToken()
+            let asset = driveService.makePlayerAsset(for: targetId, accessToken: token)
+            return ActivePlayback(
+                id: targetId,
+                episodes: episodes,
+                initialEpisode: initial,
+                engine: .avPlayer(asset)
+            )
+        } catch {
+            errorMessage = error.localizedDescription
+            return nil
+        }
+    }
+
+    private func playerEpisode(from item: MediaItem) -> PlayerEpisode {
         let displayTitle: String
         if let code = item.episodeCode, let epTitle = item.episodeTitle, epTitle != code {
             displayTitle = "\(item.showTitle) • \(code) \(epTitle)"
@@ -164,19 +198,24 @@ final class LibraryViewModel: ObservableObject {
             displayTitle = item.showTitle
         }
 
-        let targetId = item.file.effectiveId
-        if item.file.prefersVLCPlayer {
-            return ActivePlayback(id: targetId, title: displayTitle, engine: .vlc)
+        let shortTitle: String
+        if let code = item.episodeCode, let epTitle = item.episodeTitle, epTitle != code {
+            shortTitle = "\(code) • \(epTitle)"
+        } else if let code = item.episodeCode {
+            shortTitle = code
+        } else {
+            shortTitle = item.file.name
         }
 
-        do {
-            let token = try await authManager.validAccessToken()
-            let asset = driveService.makePlayerAsset(for: targetId, accessToken: token)
-            return ActivePlayback(id: targetId, title: displayTitle, engine: .avPlayer(asset))
-        } catch {
-            errorMessage = error.localizedDescription
-            return nil
-        }
+        return PlayerEpisode(
+            id: item.file.effectiveId,
+            title: displayTitle,
+            shortTitle: shortTitle,
+            subtitle: item.file.formattedSize,
+            episodeCode: item.episodeCode,
+            stillURL: item.stillURL,
+            prefersVLC: item.file.prefersVLCPlayer
+        )
     }
 
     private func enrichMetadata(for sourceItems: [MediaItem], generation: Int) async {
@@ -410,7 +449,11 @@ private struct LibraryHomeView: View {
                 }
             }
             .fullScreenCover(item: $activePlayback) { playback in
-                VideoPlayerView(fileId: playback.id, title: playback.title, engine: playback.engine)
+                VideoPlayerView(
+                    episodes: playback.episodes,
+                    initialEpisode: playback.initialEpisode,
+                    engine: playback.engine
+                )
             }
         }
     }
@@ -425,7 +468,7 @@ private struct LibraryHomeView: View {
                 LazyHStack(spacing: 14) {
                     ForEach(continueWatchingItems, id: \.item.id) { entry in
                         Button {
-                            play(entry.item)
+                            play(entry.item, in: nil)
                         } label: {
                             ContinueWatchingCard(item: entry.item, progress: entry.progress)
                         }
@@ -463,7 +506,9 @@ private struct LibraryHomeView: View {
                                 groupID: group.id,
                                 fallbackGroup: group,
                                 viewModel: viewModel,
-                                onPlay: play
+                                onPlay: { item in
+                                    play(item, in: group.items)
+                                }
                             )
                         } label: {
                             ShowCard(group: group)
@@ -482,7 +527,7 @@ private struct LibraryHomeView: View {
                         }
                     } else if let singleItem = group.items.first {
                         Button {
-                            play(singleItem)
+                            play(singleItem, in: group.items)
                         } label: {
                             ShowCard(group: group)
                         }
@@ -527,9 +572,13 @@ private struct LibraryHomeView: View {
         )
     }
 
-    private func play(_ item: MediaItem) {
+    private func play(_ item: MediaItem, in orderedItems: [MediaItem]? = nil) {
         Task {
-            activePlayback = await viewModel.makePlayback(for: item, authManager: authManager)
+            activePlayback = await viewModel.makePlayback(
+                for: item,
+                in: orderedItems,
+                authManager: authManager
+            )
         }
     }
 }
