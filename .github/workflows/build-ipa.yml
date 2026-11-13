@@ -16,7 +16,10 @@ jobs:
 
       - name: Download MobileVLCKit
         run: |
-          VLC_URL=$(curl -s https://trunk.cocoapods.org/api/v1/pods/MobileVLCKit/specs/3.7.5 | jq -r '.source.http')
+          VLC_URL=$(curl -sSL https://trunk.cocoapods.org/api/v1/pods/MobileVLCKit/specs/3.7.5 | jq -r '.source.http // empty' || true)
+          if [ -z "$VLC_URL" ]; then
+            VLC_URL="https://download.videolan.org/pub/cocoapods/prod/MobileVLCKit-3.7.5-a213fd11-6de05adc.tar.xz"
+          fi
           curl -fL "$VLC_URL" -o MobileVLCKit.tar.xz
           mkdir -p Frameworks
           tar -xf MobileVLCKit.tar.xz -C Frameworks
