@@ -37,6 +37,7 @@ struct MediaItem: Identifiable, Hashable {
 
 struct ShowGroup: Identifiable, Hashable {
     let id: String
+    let rawTitle: String
     let title: String
     let items: [MediaItem]
 
@@ -57,7 +58,7 @@ struct ShowGroup: Identifiable, Hashable {
 struct ActivePlayback: Identifiable {
     let id: String
     let title: String
-    let asset: AVURLAsset
+    let engine: PlaybackEngine
 }
 
 @MainActor
@@ -71,7 +72,7 @@ final class LibraryViewModel: ObservableObject {
 
     var showGroups: [ShowGroup] {
         let grouped = Dictionary(grouping: items) { item in
-            item.showTitle.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            TMDBService.shared.normalizedShowKey(item.parsed.title)
         }
 
         return grouped.map { key, groupItems in
@@ -84,16 +85,23 @@ final class LibraryViewModel: ObservableObject {
                 if le != re { return le < re }
                 return lhs.file.name.localizedStandardCompare(rhs.file.name) == .orderedAscending
             }
+            let rawTitle = sorted.first?.parsed.title ?? "Videos"
+            let displayTitle = sorted.first?.showTitle ?? rawTitle
             return ShowGroup(
                 id: key.isEmpty ? UUID().uuidString : key,
-                title: sorted.first?.showTitle ?? "Videos",
+                rawTitle: rawTitle,
+                title: displayTitle,
                 items: sorted
             )
         }
         .sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
     }
 
-    func loadLibrary(authManager: AuthManager, folderID: String, tmdbAPIKey: String) async {
+    func group(forID id: String) -> ShowGroup? {
+        showGroups.first { $0.id == id }
+    }
+
+    func loadLibrary(authManager: AuthManager, folderID: String) async {
         loadGeneration += 1
         let generation = loadGeneration
         isLoading = true
@@ -113,10 +121,8 @@ final class LibraryViewModel: ObservableObject {
             items = initialItems
             isLoading = false
 
-            let trimmedKey = tmdbAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmedKey.isEmpty, !initialItems.isEmpty else { return }
-
-            await enrichMetadata(for: initialItems, apiKey: trimmedKey, generation: generation)
+            guard !initialItems.isEmpty else { return }
+            await enrichMetadata(for: initialItems, generation: generation)
         } catch {
             guard generation == loadGeneration else { return }
             isLoading = false
@@ -124,28 +130,51 @@ final class LibraryViewModel: ObservableObject {
         }
     }
 
+    func refreshEnrichedMetadata() async {
+        guard !items.isEmpty else { return }
+        loadGeneration += 1
+        let generation = loadGeneration
+        await enrichMetadata(for: items, generation: generation)
+    }
+
     func makePlayback(for item: MediaItem, authManager: AuthManager) async -> ActivePlayback? {
+        let displayTitle: String
+        if let code = item.episodeCode, let epTitle = item.episodeTitle, epTitle != code {
+            displayTitle = "\(item.showTitle) • \(code) \(epTitle)"
+        } else if let code = item.episodeCode {
+            displayTitle = "\(item.showTitle) • \(code)"
+        } else {
+            displayTitle = item.showTitle
+        }
+
+        if item.file.prefersVLCPlayer {
+            LocalStreamProxy.shared.start(authManager: authManager)
+            do {
+                _ = try await authManager.validAccessToken()
+            } catch {
+                errorMessage = error.localizedDescription
+                return nil
+            }
+            guard let proxyURL = LocalStreamProxy.shared.streamURL(for: item.file.id) else {
+                errorMessage = "Could not build local stream URL."
+                return nil
+            }
+            return ActivePlayback(id: item.file.id, title: displayTitle, engine: .vlc(proxyURL))
+        }
+
         do {
             let token = try await authManager.validAccessToken()
             let asset = driveService.makePlayerAsset(for: item.file.id, accessToken: token)
-            let displayTitle: String
-            if let code = item.episodeCode, let epTitle = item.episodeTitle, epTitle != code {
-                displayTitle = "\(item.showTitle) • \(code) \(epTitle)"
-            } else if let code = item.episodeCode {
-                displayTitle = "\(item.showTitle) • \(code)"
-            } else {
-                displayTitle = item.showTitle
-            }
-            return ActivePlayback(id: item.file.id, title: displayTitle, asset: asset)
+            return ActivePlayback(id: item.file.id, title: displayTitle, engine: .avPlayer(asset))
         } catch {
             errorMessage = error.localizedDescription
             return nil
         }
     }
 
-    private func enrichMetadata(for sourceItems: [MediaItem], apiKey: String, generation: Int) async {
+    private func enrichMetadata(for sourceItems: [MediaItem], generation: Int) async {
         var updated = sourceItems
-        let batchSize = 5
+        let batchSize = 6
 
         for start in stride(from: 0, to: sourceItems.count, by: batchSize) {
             guard generation == loadGeneration else { return }
@@ -155,7 +184,7 @@ final class LibraryViewModel: ObservableObject {
                 for idx in start..<end {
                     let file = sourceItems[idx].file
                     group.addTask {
-                        let meta = await TMDBService.shared.metadata(for: file, apiKey: apiKey)
+                        let meta = await TMDBService.shared.metadata(for: file)
                         return (idx, meta)
                     }
                 }
@@ -218,7 +247,7 @@ private struct SignInView: View {
                         .font(.system(size: 34, weight: .bold, design: .rounded))
                         .foregroundStyle(.white)
 
-                    Text("Stream videos directly from Google Drive with instant scrubbing, Picture-in-Picture, AirPlay, and TMDB metadata.")
+                    Text("Stream MKV, AVI, and MP4 videos directly from Google Drive with MobileVLCKit, instant scrubbing, and automatic show artwork.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
@@ -265,16 +294,22 @@ private struct SignInView: View {
 
 // MARK: - Library Home View
 
+private struct CoverFinderTarget: Identifiable {
+    let id: String
+    let rawTitle: String
+    let displayTitle: String
+}
+
 private struct LibraryHomeView: View {
     @EnvironmentObject private var authManager: AuthManager
     @StateObject private var viewModel = LibraryViewModel()
     @ObservedObject private var playbackStore = PlaybackStore.shared
 
     @AppStorage("drive_folder_id") private var folderID = ""
-    @AppStorage("tmdb_api_key") private var tmdbAPIKey = ""
 
     @State private var showSettings = false
     @State private var activePlayback: ActivePlayback?
+    @State private var coverFinderTarget: CoverFinderTarget?
     @State private var hasLoadedOnce = false
 
     private var continueWatchingItems: [(item: MediaItem, progress: PlaybackProgress)] {
@@ -346,6 +381,7 @@ private struct LibraryHomeView: View {
                 }
             }
             .task {
+                LocalStreamProxy.shared.start(authManager: authManager)
                 guard !hasLoadedOnce else { return }
                 hasLoadedOnce = true
                 await reload()
@@ -353,14 +389,21 @@ private struct LibraryHomeView: View {
             .sheet(isPresented: $showSettings) {
                 SettingsView(
                     folderID: $folderID,
-                    tmdbAPIKey: $tmdbAPIKey,
                     onSaveOrChange: {
                         Task { await reload() }
                     }
                 )
             }
+            .sheet(item: $coverFinderTarget) { target in
+                CoverFinderSheet(
+                    rawShowTitle: target.rawTitle,
+                    initialQuery: target.displayTitle
+                ) {
+                    await viewModel.refreshEnrichedMetadata()
+                }
+            }
             .fullScreenCover(item: $activePlayback) { playback in
-                VideoPlayerView(fileId: playback.id, title: playback.title, asset: playback.asset)
+                VideoPlayerView(fileId: playback.id, title: playback.title, engine: playback.engine)
             }
         }
     }
@@ -403,17 +446,33 @@ private struct LibraryHomeView: View {
             }
 
             LazyVGrid(
-                columns: [GridItem(.adaptive(minimum: 155), spacing: 16)],
+                columns: [GridItem(.adaptive(minimum: 150), spacing: 16)],
                 spacing: 20
             ) {
                 ForEach(viewModel.showGroups) { group in
                     if group.isSeries {
                         NavigationLink {
-                            ShowDetailView(group: group, onPlay: play)
+                            ShowDetailView(
+                                groupID: group.id,
+                                fallbackGroup: group,
+                                viewModel: viewModel,
+                                onPlay: play
+                            )
                         } label: {
                             ShowCard(group: group)
                         }
                         .buttonStyle(.plain)
+                        .contextMenu {
+                            Button {
+                                coverFinderTarget = CoverFinderTarget(
+                                    id: group.id,
+                                    rawTitle: group.rawTitle,
+                                    displayTitle: group.title
+                                )
+                            } label: {
+                                Label("Find Cover / Match Show", systemImage: "wand.and.stars")
+                            }
+                        }
                     } else if let singleItem = group.items.first {
                         Button {
                             play(singleItem)
@@ -421,6 +480,17 @@ private struct LibraryHomeView: View {
                             ShowCard(group: group)
                         }
                         .buttonStyle(.plain)
+                        .contextMenu {
+                            Button {
+                                coverFinderTarget = CoverFinderTarget(
+                                    id: group.id,
+                                    rawTitle: group.rawTitle,
+                                    displayTitle: group.title
+                                )
+                            } label: {
+                                Label("Find Cover / Match Show", systemImage: "wand.and.stars")
+                            }
+                        }
                     }
                 }
             }
@@ -446,8 +516,7 @@ private struct LibraryHomeView: View {
     private func reload() async {
         await viewModel.loadLibrary(
             authManager: authManager,
-            folderID: folderID,
-            tmdbAPIKey: tmdbAPIKey
+            folderID: folderID
         )
     }
 
@@ -467,16 +536,22 @@ private struct ContinueWatchingCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             ZStack(alignment: .bottomLeading) {
-                RemoteThumbnailView(url: item.stillURL, fallbackSymbol: "play.fill")
+                Color.white.opacity(0.08)
                     .frame(width: 230, height: 129)
-                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .overlay {
+                        RemoteThumbnailView(url: item.stillURL, fallbackSymbol: "play.fill")
+                    }
+                    .frame(width: 230, height: 129)
+                    .clipped()
+                    .cornerRadius(12)
 
                 LinearGradient(
                     colors: [.clear, .black.opacity(0.75)],
                     startPoint: .center,
                     endPoint: .bottom
                 )
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .frame(width: 230, height: 129)
+                .cornerRadius(12)
 
                 VStack(alignment: .leading, spacing: 4) {
                     if let code = item.episodeCode {
@@ -493,6 +568,7 @@ private struct ContinueWatchingCard: View {
                 }
                 .padding(8)
             }
+            .frame(width: 230, height: 129)
 
             Text(item.showTitle)
                 .font(.subheadline.weight(.semibold))
@@ -538,28 +614,36 @@ private struct ShowCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             ZStack(alignment: .topTrailing) {
-                RemoteThumbnailView(url: group.posterURL, fallbackSymbol: group.isSeries ? "tv" : "film")
-                    .aspectRatio(2 / 3, contentMode: .fill)
-                    .frame(maxWidth: .infinity)
-                    .background(Color.white.opacity(0.06))
-                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                Color.white.opacity(0.06)
+                    .frame(height: 225)
+                    .overlay {
+                        RemoteThumbnailView(url: group.posterURL, fallbackSymbol: group.isSeries ? "tv" : "film")
+                            .aspectRatio(2 / 3, contentMode: .fill)
+                    }
+                    .frame(height: 225)
+                    .clipped()
+                    .cornerRadius(12)
 
                 if group.isSeries {
                     Text("\(group.items.count) ep")
                         .font(.caption2.bold())
                         .padding(.horizontal, 7)
                         .padding(.vertical, 3)
-                        .background(.black.opacity(0.75))
+                        .background(.black.opacity(0.78))
                         .clipShape(Capsule())
                         .padding(8)
                 }
             }
+            .frame(height: 225)
+            .clipped()
+            .cornerRadius(12)
 
             Text(group.title)
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(.white)
                 .lineLimit(2)
                 .multilineTextAlignment(.leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }
@@ -567,16 +651,30 @@ private struct ShowCard: View {
 // MARK: - Show Detail View
 
 private struct ShowDetailView: View {
-    let group: ShowGroup
+    let groupID: String
+    let fallbackGroup: ShowGroup
+    @ObservedObject var viewModel: LibraryViewModel
     let onPlay: (MediaItem) -> Void
 
     @ObservedObject private var playbackStore = PlaybackStore.shared
     @State private var selectedSeason: Int?
+    @State private var showCoverFinder = false
 
-    init(group: ShowGroup, onPlay: @escaping (MediaItem) -> Void) {
-        self.group = group
+    private var group: ShowGroup {
+        viewModel.group(forID: groupID) ?? fallbackGroup
+    }
+
+    init(
+        groupID: String,
+        fallbackGroup: ShowGroup,
+        viewModel: LibraryViewModel,
+        onPlay: @escaping (MediaItem) -> Void
+    ) {
+        self.groupID = groupID
+        self.fallbackGroup = fallbackGroup
+        self.viewModel = viewModel
         self.onPlay = onPlay
-        _selectedSeason = State(initialValue: group.seasons.first)
+        _selectedSeason = State(initialValue: fallbackGroup.seasons.first)
     }
 
     private var filteredItems: [MediaItem] {
@@ -617,6 +715,23 @@ private struct ShowDetailView: View {
         .background(Color(red: 0.04, green: 0.04, blue: 0.06).ignoresSafeArea())
         .navigationTitle(group.title)
         .navigationBarTitleDisplayMode(.large)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    showCoverFinder = true
+                } label: {
+                    Label("Find Cover", systemImage: "wand.and.stars")
+                }
+            }
+        }
+        .sheet(isPresented: $showCoverFinder) {
+            CoverFinderSheet(
+                rawShowTitle: group.rawTitle,
+                initialQuery: group.title
+            ) {
+                await viewModel.refreshEnrichedMetadata()
+            }
+        }
     }
 }
 
@@ -627,9 +742,14 @@ private struct EpisodeRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             ZStack(alignment: .bottom) {
-                RemoteThumbnailView(url: item.stillURL, fallbackSymbol: "play.circle")
+                Color.white.opacity(0.08)
                     .frame(width: 142, height: 80)
-                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay {
+                        RemoteThumbnailView(url: item.stillURL, fallbackSymbol: "play.circle")
+                    }
+                    .frame(width: 142, height: 80)
+                    .clipped()
+                    .cornerRadius(10)
 
                 if let progress, progress.isInProgress {
                     ProgressView(value: progress.fraction)
@@ -638,6 +758,7 @@ private struct EpisodeRow: View {
                         .padding(.bottom, 4)
                 }
             }
+            .frame(width: 142, height: 80)
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
@@ -681,6 +802,133 @@ private struct EpisodeRow: View {
     }
 }
 
+// MARK: - Cover Finder Sheet
+
+private struct CoverFinderSheet: View {
+    let rawShowTitle: String
+    let initialQuery: String
+    let onApplied: () async -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var query = ""
+    @State private var results: [CoverSearchResult] = []
+    @State private var isSearching = false
+    @State private var isApplying = false
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    HStack(spacing: 10) {
+                        TextField("Search show name…", text: $query)
+                            .submitLabel(.search)
+                            .onSubmit {
+                                Task { await runSearch() }
+                            }
+                        Button {
+                            Task { await runSearch() }
+                        } label: {
+                            Image(systemName: "magnifyingglass")
+                        }
+                        .disabled(isSearching || query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                }
+
+                if isSearching {
+                    HStack {
+                        Spacer()
+                        ProgressView("Searching TVMaze & iTunes…")
+                        Spacer()
+                    }
+                    .listRowBackground(Color.clear)
+                } else if results.isEmpty {
+                    ContentUnavailableView(
+                        "No Matches",
+                        systemImage: "magnifyingglass",
+                        description: Text("Try a shorter or alternate show title.")
+                    )
+                    .listRowBackground(Color.clear)
+                } else {
+                    Section("Tap a Match to Apply Cover & Metadata") {
+                        ForEach(results) { result in
+                            Button {
+                                Task {
+                                    isApplying = true
+                                    await TMDBService.shared.applyCoverSelection(result, forShowTitle: rawShowTitle)
+                                    await onApplied()
+                                    isApplying = false
+                                    dismiss()
+                                }
+                            } label: {
+                                HStack(alignment: .top, spacing: 12) {
+                                    Color.white.opacity(0.08)
+                                        .frame(width: 60, height: 90)
+                                        .overlay {
+                                            RemoteThumbnailView(url: result.posterURL, fallbackSymbol: "tv")
+                                        }
+                                        .frame(width: 60, height: 90)
+                                        .clipped()
+                                        .cornerRadius(8)
+
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(result.title)
+                                            .font(.subheadline.weight(.semibold))
+                                            .foregroundStyle(.white)
+
+                                        HStack(spacing: 6) {
+                                            if let year = result.year, !year.isEmpty {
+                                                Text(year)
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.secondary)
+                                            }
+                                            Text(result.source.label)
+                                                .font(.caption2.bold())
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 2)
+                                                .background(Color.blue.opacity(0.2))
+                                                .foregroundStyle(.blue)
+                                                .clipShape(Capsule())
+                                        }
+
+                                        if let summary = result.summary, !summary.isEmpty {
+                                            Text(summary)
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                                .lineLimit(3)
+                                        }
+                                    }
+                                }
+                            }
+                            .disabled(isApplying)
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Find Cover / Match Show")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Close") {
+                        dismiss()
+                    }
+                }
+            }
+            .task {
+                query = initialQuery
+                await runSearch()
+            }
+        }
+    }
+
+    private func runSearch() async {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        isSearching = true
+        results = await TMDBService.shared.searchShowCandidates(query: trimmed)
+        isSearching = false
+    }
+}
+
 // MARK: - Settings View
 
 private struct SettingsView: View {
@@ -688,11 +936,9 @@ private struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
 
     @Binding var folderID: String
-    @Binding var tmdbAPIKey: String
     let onSaveOrChange: () -> Void
 
     @State private var draftFolderID = ""
-    @State private var draftTMDBKey = ""
     @State private var clearedCache = false
 
     var body: some View {
@@ -709,23 +955,19 @@ private struct SettingsView: View {
                 }
 
                 Section {
-                    TextField("TMDB API Key (v3)", text: $draftTMDBKey)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                } header: {
-                    Text("TMDB Metadata (Optional)")
-                } footer: {
-                    Text("Enter a free TMDB v3 API key to fetch show posters, 16:9 episode stills, titles, and overviews. Leave blank to use Google Drive thumbnails.")
-                }
-
-                Section("Account & Cache") {
                     Button {
                         TMDBService.shared.clearCache()
                         clearedCache = true
                     } label: {
-                        Text(clearedCache ? "TMDB Cache Cleared" : "Clear TMDB Metadata Cache")
+                        Text(clearedCache ? "Show Metadata Cache Cleared" : "Clear Show Metadata Cache")
                     }
+                } header: {
+                    Text("Artwork & Metadata")
+                } footer: {
+                    Text("Show covers, episode titles, and summaries are fetched automatically from TVMaze and iTunes with no API key required.")
+                }
 
+                Section("Account") {
                     Button(role: .destructive) {
                         authManager.signOut()
                         dismiss()
@@ -745,10 +987,8 @@ private struct SettingsView: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") {
                         let trimmedFolder = draftFolderID.trimmingCharacters(in: .whitespacesAndNewlines)
-                        let trimmedKey = draftTMDBKey.trimmingCharacters(in: .whitespacesAndNewlines)
-                        let changed = trimmedFolder != folderID || trimmedKey != tmdbAPIKey || clearedCache
+                        let changed = trimmedFolder != folderID || clearedCache
                         folderID = trimmedFolder
-                        tmdbAPIKey = trimmedKey
                         dismiss()
                         if changed {
                             onSaveOrChange()
@@ -758,7 +998,6 @@ private struct SettingsView: View {
             }
             .onAppear {
                 draftFolderID = folderID
-                draftTMDBKey = tmdbAPIKey
             }
         }
     }

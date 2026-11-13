@@ -21,6 +21,21 @@ struct DriveFile: Identifiable, Codable, Hashable {
     let videoMediaMetadata: VideoMediaMetadata?
     var folderName: String?
 
+    var fileExtension: String {
+        (name as NSString).pathExtension.lowercased()
+    }
+
+    var prefersVLCPlayer: Bool {
+        let nativeExtensions: Set<String> = ["mp4", "m4v", "mov"]
+        if nativeExtensions.contains(fileExtension) {
+            return false
+        }
+        if ["mkv", "avi", "webm", "wmv", "flv", "ts", "m2ts", "mpg", "mpeg", "ogv"].contains(fileExtension) {
+            return true
+        }
+        return mimeType.lowercased().contains("matroska") || mimeType.lowercased().contains("avi")
+    }
+
     var formattedSize: String? {
         guard let size, let bytes = Int64(size) else { return nil }
         return ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
@@ -41,8 +56,10 @@ final class DriveService {
 
     func fetchVideoFiles(folderID: String?, authManager: AuthManager) async throws -> [DriveFile] {
         let trimmedFolder = folderID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let mediaFilter = "(mimeType contains 'video/' or name contains '.mp4' or name contains '.m4v' or name contains '.mov' or name contains '.mkv' or name contains '.avi')"
+
         if trimmedFolder.isEmpty {
-            let query = "trashed = false and (mimeType contains 'video/' or name contains '.mp4' or name contains '.m4v' or name contains '.mov')"
+            let query = "trashed = false and \(mediaFilter)"
             return try await listAllPages(query: query, folderName: nil, authManager: authManager)
         }
 
@@ -55,7 +72,7 @@ final class DriveService {
             let current = queue.removeFirst()
             let escapedId = current.id.replacingOccurrences(of: "'", with: "\\'")
 
-            let videoQuery = "'\(escapedId)' in parents and trashed = false and (mimeType contains 'video/' or name contains '.mp4' or name contains '.m4v' or name contains '.mov')"
+            let videoQuery = "'\(escapedId)' in parents and trashed = false and \(mediaFilter)"
             let videos = try await listAllPages(query: videoQuery, folderName: current.showHint, authManager: authManager)
             allVideos.append(contentsOf: videos)
 
@@ -63,7 +80,7 @@ final class DriveService {
             let subfolders = try await listAllPages(query: folderQuery, folderName: nil, authManager: authManager)
             for folder in subfolders where !visitedFolders.contains(folder.id) {
                 visitedFolders.insert(folder.id)
-                let nextHint = isSeasonFolder(folder.name) ? (current.showHint ?? folder.name) : folder.name
+                let nextHint = isSeasonFolder(folder.name) ? current.showHint : folder.name
                 queue.append((folder.id, nextHint))
             }
         }
@@ -72,7 +89,11 @@ final class DriveService {
     }
 
     private func isSeasonFolder(_ name: String) -> Bool {
-        name.range(of: #"^(?:season|s)\s*\d+$"#, options: [.regularExpression, .caseInsensitive]) != nil
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.range(
+            of: #"^(?:season(?:\s+.*|\d+)?|s\s*\d+|specials|extras)$"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
     }
 
     func makePlayerAsset(for fileId: String, accessToken: String) -> AVURLAsset {

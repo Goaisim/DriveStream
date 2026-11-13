@@ -14,6 +14,19 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Download MobileVLCKit
+        run: |
+          VLC_URL=$(curl -s https://trunk.cocoapods.org/api/v1/pods/MobileVLCKit/specs/3.7.5 | jq -r '.source.http')
+          curl -fL "$VLC_URL" -o MobileVLCKit.tar.xz
+          mkdir -p Frameworks
+          tar -xf MobileVLCKit.tar.xz -C Frameworks
+          XC_PATH=$(find Frameworks -maxdepth 4 -name "MobileVLCKit.xcframework" -type d | head -n 1)
+          if [ -n "$XC_PATH" ] && [ "$XC_PATH" != "Frameworks/MobileVLCKit.xcframework" ]; then
+            mv "$XC_PATH" Frameworks/MobileVLCKit.xcframework
+          fi
+          rm -f MobileVLCKit.tar.xz
+          ls -la Frameworks/MobileVLCKit.xcframework
+
       - name: Generate Xcode project
         run: |
           command -v xcodegen >/dev/null 2>&1 || brew install xcodegen
