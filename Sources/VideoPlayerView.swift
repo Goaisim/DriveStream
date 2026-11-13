@@ -78,7 +78,7 @@ final class PlaybackStore: ObservableObject {
 }
 
 enum PlaybackEngine {
-    case vlc(URL)
+    case vlc
     case avPlayer(AVURLAsset)
 }
 
@@ -91,8 +91,8 @@ struct VideoPlayerView: View {
 
     var body: some View {
         switch engine {
-        case .vlc(let streamURL):
-            VLCPlayerContainerView(fileId: fileId, title: title, streamURL: streamURL) {
+        case .vlc:
+            VLCPlayerContainerView(fileId: fileId, title: title) {
                 dismiss()
             }
         case .avPlayer(let asset):
@@ -116,7 +116,7 @@ struct VideoPlayerView: View {
     }
 }
 
-// MARK: - MobileVLCKit Player
+// MARK: - MobileVLCKit ViewModel & Player
 
 private struct VLCTrackOption: Identifiable, Hashable {
     let id: Int32
@@ -124,32 +124,40 @@ private struct VLCTrackOption: Identifiable, Hashable {
 }
 
 @MainActor
-private final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
-    let mediaPlayer = VLCMediaPlayer()
+private final class VLCPlayerViewModel: NSObject, ObservableObject, VLCMediaPlayerDelegate {
+    let player = VLCMediaPlayer()
+    let videoSurfaceView: UIView = {
+        let view = UIView()
+        view.backgroundColor = .black
+        view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        return view
+    }()
 
+    @Published var isLoading = true
     @Published var isPlaying = false
-    @Published var isBuffering = true
     @Published var currentTime: TimeInterval = 0
     @Published var duration: TimeInterval = 0
     @Published var audioTracks: [VLCTrackOption] = []
     @Published var subtitleTracks: [VLCTrackOption] = []
     @Published var currentAudioTrackIndex: Int32 = -1
     @Published var currentSubtitleTrackIndex: Int32 = -1
+    @Published var vlcStateString = "Initializing…"
     @Published var errorMessage: String?
 
     private let fileId: String
-    private var didAttemptResume = false
     private var didStartPlayback = false
+    private var didAttemptResume = false
     private var didStop = false
     private var lastSavedAt: Date = .distantPast
 
     init(fileId: String) {
         self.fileId = fileId
         super.init()
-        mediaPlayer.delegate = self
+        player.drawable = videoSurfaceView
+        player.delegate = self
     }
 
-    func start(url: URL, drawable: UIView) {
+    func startPlayback() async {
         guard !didStartPlayback else { return }
         didStartPlayback = true
 
@@ -160,27 +168,46 @@ private final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPla
             // Proceed if audio session setup fails on simulator
         }
 
-        let media = VLCMedia(url: url)
-        media.addOption(":network-caching=1500")
-        mediaPlayer.drawable = drawable
-        mediaPlayer.media = media
-        mediaPlayer.play()
+        vlcStateString = "Refreshing Google auth…"
+        do {
+            _ = try await AuthManager.shared.validAccessToken()
+        } catch {
+            isLoading = false
+            errorMessage = error.localizedDescription
+            return
+        }
+
+        vlcStateString = "Starting proxy :8765…"
+        let port = await LocalStreamProxy.shared.ensureReady()
+        guard let proxyURL = LocalStreamProxy.shared.streamURL(for: fileId, port: port) else {
+            isLoading = false
+            errorMessage = "Could not construct stream URL."
+            return
+        }
+
+        let media = VLCMedia(url: proxyURL)
+        media.addOptions(["network-caching": 1500])
+        player.drawable = videoSurfaceView
+        player.delegate = self
+        player.media = media
+        vlcStateString = "Opening stream…"
+        player.play()
     }
 
     func togglePlayPause() {
-        if mediaPlayer.isPlaying {
-            mediaPlayer.pause()
+        if player.isPlaying {
+            player.pause()
         } else {
-            mediaPlayer.play()
+            player.play()
         }
-        isPlaying = mediaPlayer.isPlaying
+        isPlaying = player.isPlaying
     }
 
     func skip(seconds: Int32) {
         if seconds >= 0 {
-            mediaPlayer.jumpForward(seconds)
+            player.jumpForward(seconds)
         } else {
-            mediaPlayer.jumpBackward(-seconds)
+            player.jumpBackward(-seconds)
         }
         syncTimeState()
     }
@@ -188,47 +215,48 @@ private final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPla
     func seek(to seconds: TimeInterval) {
         guard seconds.isFinite, seconds >= 0 else { return }
         let clampedMs = Int32(min(seconds * 1000.0, Double(Int32.max - 1)))
-        mediaPlayer.time = VLCTime(int: clampedMs)
+        player.time = VLCTime(int: clampedMs)
         currentTime = seconds
     }
 
     func selectAudioTrack(_ index: Int32) {
-        mediaPlayer.currentAudioTrackIndex = index
+        player.currentAudioTrackIndex = index
         currentAudioTrackIndex = index
     }
 
     func selectSubtitleTrack(_ index: Int32) {
-        mediaPlayer.currentVideoSubTitleIndex = index
+        player.currentVideoSubTitleIndex = index
         currentSubtitleTrackIndex = index
     }
 
     func refreshTracks() {
-        let aNames = mediaPlayer.audioTrackNames.compactMap { $0 as? String }
-        let aIndexes = mediaPlayer.audioTrackIndexes.compactMap { ($0 as? NSNumber)?.int32Value }
+        let aNames = player.audioTrackNames.compactMap { $0 as? String }
+        let aIndexes = player.audioTrackIndexes.compactMap { ($0 as? NSNumber)?.int32Value }
         audioTracks = zip(aIndexes, aNames).map { VLCTrackOption(id: $0.0, name: $0.1) }
-        currentAudioTrackIndex = mediaPlayer.currentAudioTrackIndex
+        currentAudioTrackIndex = player.currentAudioTrackIndex
 
-        let sNames = mediaPlayer.videoSubTitlesNames.compactMap { $0 as? String }
-        let sIndexes = mediaPlayer.videoSubTitlesIndexes.compactMap { ($0 as? NSNumber)?.int32Value }
+        let sNames = player.videoSubTitlesNames.compactMap { $0 as? String }
+        let sIndexes = player.videoSubTitlesIndexes.compactMap { ($0 as? NSNumber)?.int32Value }
         subtitleTracks = zip(sIndexes, sNames).map { VLCTrackOption(id: $0.0, name: $0.1) }
-        currentSubtitleTrackIndex = mediaPlayer.currentVideoSubTitleIndex
+        currentSubtitleTrackIndex = player.currentVideoSubTitleIndex
     }
 
     func stopAndSave() {
         guard !didStop else { return }
         didStop = true
         saveProgress(force: true)
-        mediaPlayer.delegate = nil
-        mediaPlayer.stop()
-        mediaPlayer.drawable = nil
+        player.delegate = nil
+        player.stop()
+        player.drawable = nil
     }
 
     private func syncTimeState() {
-        let currentMs = max(mediaPlayer.time.intValue, 0)
-        currentTime = TimeInterval(currentMs) / 1000.0
+        let timeMs = max(player.time.intValue, 0)
+        currentTime = Double(timeMs) / 1000.0
 
-        if let lengthMs = mediaPlayer.media?.length.intValue, lengthMs > 0 {
-            duration = TimeInterval(lengthMs) / 1000.0
+        let lengthMs = player.media?.length.intValue ?? 0
+        if lengthMs > 0 {
+            duration = Double(lengthMs) / 1000.0
         }
     }
 
@@ -252,30 +280,38 @@ private final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPla
         PlaybackStore.shared.save(fileId: fileId, position: currentTime, duration: duration)
     }
 
+    private func stateLabel(for state: VLCMediaPlayerState) -> String {
+        switch state {
+        case .stopped: return "VLC: Stopped"
+        case .opening: return "VLC: Opening"
+        case .buffering: return "VLC: Buffering"
+        case .ended: return "VLC: Ended"
+        case .error: return "VLC: Error"
+        case .playing: return "VLC: Playing"
+        case .paused: return "VLC: Paused"
+        @unknown default: return "VLC: Unknown"
+        }
+    }
+
     // MARK: - VLCMediaPlayerDelegate
 
     nonisolated func mediaPlayerStateChanged(_ aNotification: Notification) {
         Task { @MainActor [weak self] in
             guard let self else { return }
-            let state = self.mediaPlayer.state
-            self.isPlaying = self.mediaPlayer.isPlaying
-            if state == .opening {
-                self.isBuffering = true
-            } else if state == .buffering {
-                if !self.mediaPlayer.isPlaying && self.currentTime == 0 {
-                    self.isBuffering = true
-                }
-            } else {
-                self.isBuffering = false
-            }
+            let state = self.player.state
+            self.vlcStateString = self.stateLabel(for: state)
+            self.isPlaying = self.player.isPlaying
 
             if state == .playing || state == .paused {
+                self.isLoading = false
                 self.syncTimeState()
                 self.refreshTracks()
                 self.attemptResumeIfNeeded()
             } else if state == .error {
-                self.errorMessage = "Unable to play stream via MobileVLCKit."
+                self.isLoading = false
+                self.errorMessage = "MobileVLCKit could not open stream (\(LocalStreamProxy.shared.lastStatus))."
             } else if state == .ended {
+                self.isLoading = false
                 self.saveProgress(force: true)
             }
         }
@@ -284,9 +320,12 @@ private final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPla
     nonisolated func mediaPlayerTimeChanged(_ aNotification: Notification) {
         Task { @MainActor [weak self] in
             guard let self else { return }
-            self.isPlaying = self.mediaPlayer.isPlaying
-            self.isBuffering = false
-            self.syncTimeState()
+            if self.player.isPlaying || self.player.time.intValue > 0 {
+                self.isLoading = false
+                self.isPlaying = true
+                self.currentTime = Double(max(self.player.time.intValue, 0)) / 1000.0
+                self.duration = Double(max(self.player.media?.length.intValue ?? 0, 0)) / 1000.0
+            }
             if self.audioTracks.isEmpty {
                 self.refreshTracks()
             }
@@ -296,28 +335,11 @@ private final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPla
     }
 }
 
-private final class VLCDrawableUIView: UIView {
-    var onMountedInWindow: ((UIView) -> Void)?
-
-    override func didMoveToWindow() {
-        super.didMoveToWindow()
-        if window != nil {
-            onMountedInWindow?(self)
-        }
-    }
-}
-
-private struct VLCVideoSurface: UIViewRepresentable {
-    let controller: VLCPlayerController
-    let streamURL: URL
+private struct VLCVideoSurfaceView: UIViewRepresentable {
+    let surfaceView: UIView
 
     func makeUIView(context: Context) -> UIView {
-        let view = VLCDrawableUIView()
-        view.backgroundColor = .black
-        view.onMountedInWindow = { [weak controller] mountedView in
-            controller?.start(url: streamURL, drawable: mountedView)
-        }
-        return view
+        surfaceView
     }
 
     func updateUIView(_ uiView: UIView, context: Context) {}
@@ -326,29 +348,29 @@ private struct VLCVideoSurface: UIViewRepresentable {
 private struct VLCPlayerContainerView: View {
     let fileId: String
     let title: String
-    let streamURL: URL
     let onClose: () -> Void
 
-    @StateObject private var controller: VLCPlayerController
+    @StateObject private var viewModel: VLCPlayerViewModel
+    @ObservedObject private var proxy = LocalStreamProxy.shared
+
     @State private var showControls = true
     @State private var isScrubbing = false
     @State private var scrubPosition: TimeInterval = 0
     @State private var isLandscape = false
     @State private var hideTask: Task<Void, Never>?
 
-    init(fileId: String, title: String, streamURL: URL, onClose: @escaping () -> Void) {
+    init(fileId: String, title: String, onClose: @escaping () -> Void) {
         self.fileId = fileId
         self.title = title
-        self.streamURL = streamURL
         self.onClose = onClose
-        _controller = StateObject(wrappedValue: VLCPlayerController(fileId: fileId))
+        _viewModel = StateObject(wrappedValue: VLCPlayerViewModel(fileId: fileId))
     }
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            VLCVideoSurface(controller: controller, streamURL: streamURL)
+            VLCVideoSurfaceView(surfaceView: viewModel.videoSurfaceView)
                 .ignoresSafeArea()
                 .contentShape(Rectangle())
                 .onTapGesture {
@@ -358,16 +380,27 @@ private struct VLCPlayerContainerView: View {
                     scheduleAutoHide()
                 }
 
-            if controller.isBuffering && controller.errorMessage == nil {
-                ProgressView()
-                    .scaleEffect(1.3)
-                    .tint(.white)
-                    .padding(18)
-                    .background(.black.opacity(0.55))
-                    .clipShape(Circle())
+            if viewModel.isLoading && viewModel.errorMessage == nil {
+                VStack(spacing: 12) {
+                    ProgressView()
+                        .scaleEffect(1.3)
+                        .tint(.white)
+                    Text(viewModel.vlcStateString)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.white)
+                    Text(proxy.lastStatus)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 16)
+                .background(.black.opacity(0.7))
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .padding(.horizontal, 24)
             }
 
-            if let error = controller.errorMessage {
+            if let error = viewModel.errorMessage {
                 VStack(spacing: 12) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.largeTitle)
@@ -375,12 +408,14 @@ private struct VLCPlayerContainerView: View {
                     Text(error)
                         .font(.subheadline)
                         .foregroundStyle(.white)
+                        .multilineTextAlignment(.center)
                     Button("Close", action: closePlayer)
                         .buttonStyle(.borderedProminent)
                 }
                 .padding(24)
                 .background(.ultraThinMaterial)
                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .padding(.horizontal, 24)
             }
 
             if showControls {
@@ -389,12 +424,13 @@ private struct VLCPlayerContainerView: View {
             }
         }
         .statusBarHidden(true)
-        .onAppear {
+        .task {
             scheduleAutoHide()
+            await viewModel.startPlayback()
         }
         .onDisappear {
             hideTask?.cancel()
-            controller.stopAndSave()
+            viewModel.stopAndSave()
             resetOrientation()
         }
     }
@@ -419,13 +455,13 @@ private struct VLCPlayerContainerView: View {
 
                 Spacer()
 
-                if !controller.audioTracks.isEmpty {
+                if !viewModel.audioTracks.isEmpty {
                     Menu {
-                        ForEach(controller.audioTracks) { track in
+                        ForEach(viewModel.audioTracks) { track in
                             Button {
-                                controller.selectAudioTrack(track.id)
+                                viewModel.selectAudioTrack(track.id)
                             } label: {
-                                if track.id == controller.currentAudioTrackIndex {
+                                if track.id == viewModel.currentAudioTrackIndex {
                                     Label(track.name, systemImage: "checkmark")
                                 } else {
                                     Text(track.name)
@@ -442,13 +478,13 @@ private struct VLCPlayerContainerView: View {
                     }
                 }
 
-                if !controller.subtitleTracks.isEmpty {
+                if !viewModel.subtitleTracks.isEmpty {
                     Menu {
-                        ForEach(controller.subtitleTracks) { track in
+                        ForEach(viewModel.subtitleTracks) { track in
                             Button {
-                                controller.selectSubtitleTrack(track.id)
+                                viewModel.selectSubtitleTrack(track.id)
                             } label: {
-                                if track.id == controller.currentSubtitleTrackIndex {
+                                if track.id == viewModel.currentSubtitleTrackIndex {
                                     Label(track.name, systemImage: "checkmark")
                                 } else {
                                     Text(track.name)
@@ -482,7 +518,7 @@ private struct VLCPlayerContainerView: View {
             // Center playback controls
             HStack(spacing: 44) {
                 Button {
-                    controller.skip(seconds: -10)
+                    viewModel.skip(seconds: -10)
                     scheduleAutoHide()
                 } label: {
                     Image(systemName: "gobackward.10")
@@ -494,10 +530,10 @@ private struct VLCPlayerContainerView: View {
                 }
 
                 Button {
-                    controller.togglePlayPause()
+                    viewModel.togglePlayPause()
                     scheduleAutoHide()
                 } label: {
-                    Image(systemName: controller.isPlaying ? "pause.fill" : "play.fill")
+                    Image(systemName: viewModel.isPlaying ? "pause.fill" : "play.fill")
                         .font(.system(size: 38, weight: .bold))
                         .foregroundStyle(.white)
                         .padding(20)
@@ -506,7 +542,7 @@ private struct VLCPlayerContainerView: View {
                 }
 
                 Button {
-                    controller.skip(seconds: 10)
+                    viewModel.skip(seconds: 10)
                     scheduleAutoHide()
                 } label: {
                     Image(systemName: "goforward.10")
@@ -524,16 +560,16 @@ private struct VLCPlayerContainerView: View {
             VStack(spacing: 6) {
                 Slider(
                     value: Binding(
-                        get: { isScrubbing ? scrubPosition : controller.currentTime },
+                        get: { isScrubbing ? scrubPosition : viewModel.currentTime },
                         set: { newValue in
                             scrubPosition = newValue
                         }
                     ),
-                    in: 0...max(controller.duration, 1),
+                    in: 0...max(viewModel.duration, 1),
                     onEditingChanged: { editing in
                         isScrubbing = editing
                         if !editing {
-                            controller.seek(to: scrubPosition)
+                            viewModel.seek(to: scrubPosition)
                             scheduleAutoHide()
                         } else {
                             hideTask?.cancel()
@@ -543,11 +579,11 @@ private struct VLCPlayerContainerView: View {
                 .tint(.blue)
 
                 HStack {
-                    Text(formatTimestamp(isScrubbing ? scrubPosition : controller.currentTime))
+                    Text(formatTimestamp(isScrubbing ? scrubPosition : viewModel.currentTime))
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.white)
                     Spacer()
-                    Text(formatTimestamp(controller.duration))
+                    Text(formatTimestamp(viewModel.duration))
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
@@ -573,7 +609,7 @@ private struct VLCPlayerContainerView: View {
     }
 
     private func closePlayer() {
-        controller.stopAndSave()
+        viewModel.stopAndSave()
         resetOrientation()
         onClose()
     }
@@ -584,7 +620,7 @@ private struct VLCPlayerContainerView: View {
             try? await Task.sleep(nanoseconds: 4_000_000_000)
             guard !Task.isCancelled else { return }
             await MainActor.run {
-                if controller.isPlaying && !isScrubbing {
+                if viewModel.isPlaying && !isScrubbing {
                     withAnimation(.easeInOut(duration: 0.25)) {
                         showControls = false
                     }

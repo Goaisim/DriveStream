@@ -164,25 +164,15 @@ final class LibraryViewModel: ObservableObject {
             displayTitle = item.showTitle
         }
 
+        let targetId = item.file.effectiveId
         if item.file.prefersVLCPlayer {
-            await LocalStreamProxy.shared.ensureReady(authManager: authManager)
-            do {
-                _ = try await authManager.validAccessToken()
-            } catch {
-                errorMessage = error.localizedDescription
-                return nil
-            }
-            guard let proxyURL = LocalStreamProxy.shared.streamURL(for: item.file.id) else {
-                errorMessage = "Could not build local stream URL."
-                return nil
-            }
-            return ActivePlayback(id: item.file.id, title: displayTitle, engine: .vlc(proxyURL))
+            return ActivePlayback(id: targetId, title: displayTitle, engine: .vlc)
         }
 
         do {
             let token = try await authManager.validAccessToken()
-            let asset = driveService.makePlayerAsset(for: item.file.id, accessToken: token)
-            return ActivePlayback(id: item.file.id, title: displayTitle, engine: .avPlayer(asset))
+            let asset = driveService.makePlayerAsset(for: targetId, accessToken: token)
+            return ActivePlayback(id: targetId, title: displayTitle, engine: .avPlayer(asset))
         } catch {
             errorMessage = error.localizedDescription
             return nil
@@ -322,7 +312,7 @@ private struct LibraryHomeView: View {
     @StateObject private var viewModel = LibraryViewModel()
     @ObservedObject private var playbackStore = PlaybackStore.shared
 
-    @AppStorage("drive_folder_id") private var folderID = ""
+    @AppStorage("drive_folder_id") private var folderID = DriveService.defaultFolderID
 
     @State private var showSettings = false
     @State private var activePlayback: ActivePlayback?
@@ -331,7 +321,7 @@ private struct LibraryHomeView: View {
 
     private var continueWatchingItems: [(item: MediaItem, progress: PlaybackProgress)] {
         viewModel.items.compactMap { item in
-            guard let progress = playbackStore.progress(for: item.file.id), progress.isInProgress else {
+            guard let progress = playbackStore.progress(for: item.file.effectiveId), progress.isInProgress else {
                 return nil
             }
             return (item, progress)
@@ -398,7 +388,7 @@ private struct LibraryHomeView: View {
                 }
             }
             .task {
-                LocalStreamProxy.shared.start(authManager: authManager)
+                LocalStreamProxy.shared.start()
                 guard !hasLoadedOnce else { return }
                 hasLoadedOnce = true
                 await reload()
@@ -442,7 +432,7 @@ private struct LibraryHomeView: View {
                         .buttonStyle(.plain)
                         .contextMenu {
                             Button(role: .destructive) {
-                                playbackStore.clearProgress(for: entry.item.file.id)
+                                playbackStore.clearProgress(for: entry.item.file.effectiveId)
                             } label: {
                                 Label("Remove from Continue Watching", systemImage: "xmark.circle")
                             }
@@ -720,7 +710,7 @@ private struct ShowDetailView: View {
                     } label: {
                         EpisodeRow(
                             item: item,
-                            progress: playbackStore.progress(for: item.file.id)
+                            progress: playbackStore.progress(for: item.file.effectiveId)
                         )
                     }
                     .buttonStyle(.plain)

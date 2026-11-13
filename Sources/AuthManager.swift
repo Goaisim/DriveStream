@@ -6,6 +6,7 @@ import UIKit
 
 @MainActor
 final class AuthManager: NSObject, ObservableObject, ASWebAuthenticationPresentationContextProviding {
+    static let shared = AuthManager()
     static let clientID = "134960325804-ohug3donf2m9l58oj794tah7f0il4arb.apps.googleusercontent.com"
     static let callbackScheme = "com.googleusercontent.apps.134960325804-ohug3donf2m9l58oj794tah7f0il4arb"
     static let redirectURI = "com.googleusercontent.apps.134960325804-ohug3donf2m9l58oj794tah7f0il4arb:/oauthredirect"

@@ -41,6 +41,7 @@ targets:
         CFBundleDisplayName: DriveStream
         UILaunchScreen: {}
         NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
           NSAllowsLocalNetworking: true
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
