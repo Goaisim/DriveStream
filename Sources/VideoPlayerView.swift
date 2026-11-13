@@ -144,6 +144,7 @@ private struct AVPlayerViewControllerWrapper: UIViewControllerRepresentable {
         uiViewController.player = nil
     }
 
+    @MainActor
     final class Coordinator {
         private let fileId: String
         private weak var player: AVPlayer?
@@ -151,11 +152,10 @@ private struct AVPlayerViewControllerWrapper: UIViewControllerRepresentable {
         private var statusObservation: NSKeyValueObservation?
         private var didSeekToSavedPosition = false
 
-        init(fileId: String) {
+        nonisolated init(fileId: String) {
             self.fileId = fileId
         }
 
-        @MainActor
         func configure(player: AVPlayer, item: AVPlayerItem) {
             self.player = player
 

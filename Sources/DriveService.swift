@@ -78,7 +78,7 @@ final class DriveService {
     func makePlayerAsset(for fileId: String, accessToken: String) -> AVURLAsset {
         let url = URL(string: "https://www.googleapis.com/drive/v3/files/\(fileId)?alt=media")!
         let headers = ["Authorization": "Bearer \(accessToken)"]
-        return AVURLAsset(url: url, options: [AVURLAssetHTTPHeaderFieldsKey: headers])
+        return AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
     }
 
     // MARK: - Private
