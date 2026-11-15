@@ -346,16 +346,43 @@ private struct CoverFinderTarget: Identifiable {
     let displayTitle: String
 }
 
+private enum LinkEditorMode: Identifiable {
+    case add
+    case edit(SavedLink)
+
+    var id: String {
+        switch self {
+        case .add:
+            return "add"
+        case .edit(let link):
+            return "edit_\(link.id.uuidString)"
+        }
+    }
+
+    var existingLink: SavedLink? {
+        switch self {
+        case .add:
+            return nil
+        case .edit(let link):
+            return link
+        }
+    }
+}
+
 private struct LibraryHomeView: View {
     @EnvironmentObject private var authManager: AuthManager
     @StateObject private var viewModel = LibraryViewModel()
     @ObservedObject private var playbackStore = PlaybackStore.shared
+    @ObservedObject private var linksManager = SavedLinksManager.shared
 
     @AppStorage("drive_folder_id") private var folderID = DriveService.defaultFolderID
 
     @State private var showSettings = false
     @State private var activePlayback: ActivePlayback?
     @State private var coverFinderTarget: CoverFinderTarget?
+    @State private var linkEditorMode: LinkEditorMode?
+    @State private var pendingWebLinkToOpen: SavedLink?
+    @State private var activeWebLink: SavedLink?
     @State private var hasLoadedOnce = false
 
     private var continueWatchingItems: [(item: MediaItem, progress: PlaybackProgress)] {
@@ -380,6 +407,10 @@ private struct LibraryHomeView: View {
                             errorBanner(error)
                         }
 
+                        if !linksManager.links.isEmpty {
+                            webLinksSection
+                        }
+
                         if !continueWatchingItems.isEmpty {
                             continueWatchingSection
                         }
@@ -392,7 +423,7 @@ private struct LibraryHomeView: View {
                     await reload()
                 }
                 .overlay {
-                    if viewModel.isLoading && viewModel.items.isEmpty {
+                    if viewModel.isLoading && viewModel.items.isEmpty && linksManager.links.isEmpty {
                         VStack(spacing: 12) {
                             ProgressView()
                                 .scaleEffect(1.2)
@@ -400,7 +431,7 @@ private struct LibraryHomeView: View {
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
                         }
-                    } else if !viewModel.isLoading && viewModel.items.isEmpty && viewModel.errorMessage == nil {
+                    } else if !viewModel.isLoading && viewModel.items.isEmpty && viewModel.errorMessage == nil && linksManager.links.isEmpty {
                         ContentUnavailableView(
                             "No Videos Found",
                             systemImage: "film.stack",
@@ -408,9 +439,44 @@ private struct LibraryHomeView: View {
                         )
                     }
                 }
+                .sheet(item: $linkEditorMode, onDismiss: {
+                    if let pending = pendingWebLinkToOpen {
+                        pendingWebLinkToOpen = nil
+                        activeWebLink = pending
+                    }
+                }) { mode in
+                    LinkEditorSheet(
+                        existingLink: mode.existingLink,
+                        onSave: { title, urlString in
+                            saveLink(mode: mode, title: title, urlString: urlString)
+                        },
+                        onSaveAndOpen: { title, urlString in
+                            if let saved = saveLink(mode: mode, title: title, urlString: urlString) {
+                                pendingWebLinkToOpen = saved
+                            }
+                        }
+                    )
+                }
+            }
+            .fullScreenCover(item: $activeWebLink) { link in
+                if let url = link.url {
+                    AdBlockBrowserView(initialURL: url)
+                }
             }
             .navigationTitle("DriveStream")
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        linkEditorMode = .add
+                    } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: "plus.circle.fill")
+                            Text("Add Link")
+                        }
+                        .font(.subheadline.weight(.semibold))
+                    }
+                }
+
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     Button {
                         Task { await reload() }
@@ -428,6 +494,7 @@ private struct LibraryHomeView: View {
             }
             .task {
                 LocalStreamProxy.shared.start()
+                AdBlockEngine.shared.prepare()
                 guard !hasLoadedOnce else { return }
                 hasLoadedOnce = true
                 await reload()
@@ -454,6 +521,47 @@ private struct LibraryHomeView: View {
                     initialEpisode: playback.initialEpisode,
                     engine: playback.engine
                 )
+            }
+        }
+    }
+
+    private var webLinksSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Web Links")
+                .font(.title3.bold())
+                .padding(.horizontal, 16)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(spacing: 12) {
+                    ForEach(linksManager.links) { link in
+                        Button {
+                            openWebLink(link)
+                        } label: {
+                            SavedLinkCard(link: link)
+                        }
+                        .buttonStyle(.plain)
+                        .contextMenu {
+                            Button {
+                                openWebLink(link)
+                            } label: {
+                                Label("Open", systemImage: "play.circle")
+                            }
+
+                            Button {
+                                linkEditorMode = .edit(link)
+                            } label: {
+                                Label("Edit", systemImage: "pencil")
+                            }
+
+                            Button(role: .destructive) {
+                                linksManager.deleteLink(id: link.id)
+                            } label: {
+                                Label("Delete", systemImage: "trash")
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal, 16)
             }
         }
     }
@@ -579,6 +687,21 @@ private struct LibraryHomeView: View {
                 in: orderedItems,
                 authManager: authManager
             )
+        }
+    }
+
+    private func openWebLink(_ link: SavedLink) {
+        guard link.url != nil else { return }
+        activeWebLink = link
+    }
+
+    @discardableResult
+    private func saveLink(mode: LinkEditorMode, title: String, urlString: String) -> SavedLink? {
+        switch mode {
+        case .add:
+            return linksManager.addLink(title: title, urlString: urlString)
+        case .edit(let existing):
+            return linksManager.updateLink(id: existing.id, title: title, urlString: urlString)
         }
     }
 }
@@ -1097,5 +1220,151 @@ private struct RemoteThumbnailView: View {
                 .font(.title2)
                 .foregroundStyle(.secondary)
         }
+    }
+}
+
+// MARK: - Web Links Card & Editor Sheet
+
+private struct SavedLinkCard: View {
+    let link: SavedLink
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top) {
+                ZStack(alignment: .bottomTrailing) {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(Color.blue.opacity(0.18))
+                        .frame(width: 40, height: 40)
+                    Image(systemName: "globe")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(.blue)
+                        .frame(width: 40, height: 40)
+                    Image(systemName: "play.circle.fill")
+                        .font(.system(size: 14))
+                        .symbolRenderingMode(.palette)
+                        .foregroundStyle(.white, .blue)
+                        .offset(x: 4, y: 4)
+                }
+
+                Spacer()
+
+                Image(systemName: "shield.lefthalf.filled")
+                    .font(.caption)
+                    .foregroundStyle(.green.opacity(0.9))
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(link.title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+
+                Text(link.displayDomain)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+        }
+        .padding(14)
+        .frame(width: 192, alignment: .leading)
+        .background(Color.white.opacity(0.06))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.white.opacity(0.1), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+}
+
+private struct LinkEditorSheet: View {
+    let existingLink: SavedLink?
+    let onSave: (String, String) -> Void
+    let onSaveAndOpen: (String, String) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var title: String
+    @State private var urlString: String
+
+    init(
+        existingLink: SavedLink?,
+        onSave: @escaping (String, String) -> Void,
+        onSaveAndOpen: @escaping (String, String) -> Void
+    ) {
+        self.existingLink = existingLink
+        self.onSave = onSave
+        self.onSaveAndOpen = onSaveAndOpen
+        _title = State(initialValue: existingLink?.title ?? "")
+        _urlString = State(initialValue: existingLink?.urlString ?? "")
+    }
+
+    private var normalizedURL: URL? {
+        SavedLinksManager.validURL(from: urlString)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("Title (optional)", text: $title)
+                        .submitLabel(.next)
+
+                    TextField("URL (e.g. example.com)", text: $urlString)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.URL)
+                        .submitLabel(.done)
+                } header: {
+                    Text("Website")
+                } footer: {
+                    if let normalizedURL {
+                        Text("Opens \(normalizedURL.absoluteString) with 3-layer ad & popup blocking.")
+                    } else {
+                        Text("Enter any website domain or URL (https:// is added automatically).")
+                    }
+                }
+
+                Section {
+                    Button {
+                        onSaveAndOpen(title, urlString)
+                        dismiss()
+                    } label: {
+                        HStack {
+                            Spacer()
+                            Label("Save & Open", systemImage: "play.fill")
+                                .fontWeight(.semibold)
+                            Spacer()
+                        }
+                    }
+                    .listRowBackground(normalizedURL != nil ? Color.blue : Color.blue.opacity(0.35))
+                    .foregroundStyle(.white)
+                    .disabled(normalizedURL == nil)
+
+                    Button {
+                        onSave(title, urlString)
+                        dismiss()
+                    } label: {
+                        HStack {
+                            Spacer()
+                            Text("Save")
+                                .fontWeight(.semibold)
+                            Spacer()
+                        }
+                    }
+                    .disabled(normalizedURL == nil)
+                }
+            }
+            .scrollContentBackground(.hidden)
+            .background(Color(red: 0.05, green: 0.05, blue: 0.08).ignoresSafeArea())
+            .navigationTitle(existingLink == nil ? "Add Link" : "Edit Link")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        dismiss()
+                    }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
     }
 }
