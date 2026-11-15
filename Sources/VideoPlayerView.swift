@@ -1149,8 +1149,9 @@ private struct AVPlayerViewControllerWrapper: UIViewControllerRepresentable {
             }
 
             timeControlStatusObservation = player.observe(\.timeControlStatus, options: [.new]) { [weak self] observedPlayer, _ in
+                let isPaused = observedPlayer.timeControlStatus == .paused
                 Task { @MainActor in
-                    guard let self, observedPlayer.timeControlStatus == .paused else { return }
+                    guard let self, isPaused else { return }
                     self.persistCurrentTime()
                     SyncManager.shared.scheduleSyncAfterChange()
                 }

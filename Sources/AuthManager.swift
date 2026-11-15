@@ -22,7 +22,7 @@ final class AuthManager: NSObject, ObservableObject, ASWebAuthenticationPresenta
 
     @Published private(set) var isAuthenticated = false
     @Published private(set) var isSigningIn = false
-    @Published private(set) var hasAppDataScope: Bool = AuthManager.storedHasAppDataScope()
+    @Published private(set) var hasAppDataScope = false
     @Published var authError: String?
 
     private var activeSession: ASWebAuthenticationSession?
@@ -33,6 +33,7 @@ final class AuthManager: NSObject, ObservableObject, ASWebAuthenticationPresenta
         let hasToken = UserDefaults.standard.string(forKey: Keys.accessToken) != nil
         let hasRefresh = UserDefaults.standard.string(forKey: Keys.refreshToken) != nil
         isAuthenticated = hasToken || hasRefresh
+        hasAppDataScope = Self.storedHasAppDataScope()
     }
 
     func signIn() async {

@@ -280,9 +280,8 @@ final class TMDBService {
             let existing = cache.manualBindings[showKey]
             let sameId = existing?.tvMazeId == remote.tvmazeShowId
             let samePoster = existing?.posterURL?.absoluteString == remote.posterUrl
-            if existing != nil && sameId && samePoster {
-                if (existing?.updatedAt ?? 0) < (remote.updatedAt ?? 0) {
-                    var bumped = existing!
+            if var bumped = existing, sameId && samePoster {
+                if (bumped.updatedAt ?? 0) < (remote.updatedAt ?? 0) {
                     bumped.updatedAt = remote.updatedAt
                     cache.manualBindings[showKey] = bumped
                     cache.shows[showKey] = bumped

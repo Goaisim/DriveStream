@@ -1,3 +1,4 @@
+import Combine
 import Darwin
 import Foundation
 
@@ -20,6 +21,14 @@ struct DriveStreamSyncState: Codable, Equatable {
     var deletedLinkIds: [String: Double] = [:]
     var watchProgress: [String: WatchProgressEntry] = [:]
     var customCovers: [String: CustomCoverMatch] = [:]
+
+    private enum CodingKeys: String, CodingKey {
+        case version
+        case savedLinks
+        case deletedLinkIds
+        case watchProgress
+        case customCovers
+    }
 
     init(
         version: Int = 1,
@@ -49,7 +58,7 @@ struct DriveStreamSyncState: Codable, Equatable {
 final class SyncManager: ObservableObject {
     static let shared = SyncManager()
 
-    static let peerPort = 8766
+    nonisolated static let peerPort = 8766
     static let cloudFileName = "drivestream_sync.json"
 
     private enum Keys {
@@ -641,7 +650,12 @@ final class SyncManager: ObservableObject {
         }
         bytes[6] = (bytes[6] & 0x0F) | 0x40
         bytes[8] = (bytes[8] & 0x3F) | 0x80
-        return NSUUID(uuidBytes: bytes) as UUID
+        return UUID(uuid: (
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[12], bytes[13], bytes[14], bytes[15]
+        ))
     }
 
     nonisolated private static func detectLocalIPv4() -> String? {
@@ -657,17 +671,17 @@ final class SyncManager: ObservableObject {
                   addr.pointee.sa_family == UInt8(AF_INET) else {
                 continue
             }
-            let flags = Int32(current.pointee.ifa_flags)
-            guard (flags & IFF_UP) != 0, (flags & IFF_LOOPBACK) == 0 else {
+            let flags = UInt32(current.pointee.ifa_flags)
+            // IFF_UP = 0x1, IFF_LOOPBACK = 0x8
+            guard (flags & 0x1) != 0, (flags & 0x8) == 0 else {
                 continue
             }
             let name = String(cString: current.pointee.ifa_name)
             var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-            let result = addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { sinPtr in
-                var sinAddr = sinPtr.pointee.sin_addr
-                return inet_ntop(AF_INET, &sinAddr, &buffer, socklen_t(INET_ADDRSTRLEN))
+            var sinAddr = addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr }
+            guard inet_ntop(AF_INET, &sinAddr, &buffer, socklen_t(INET_ADDRSTRLEN)) != nil else {
+                continue
             }
-            guard result != nil else { continue }
             let ip = String(cString: buffer)
             if name == "en0" {
                 return ip
