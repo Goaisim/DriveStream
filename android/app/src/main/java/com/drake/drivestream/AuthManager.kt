@@ -203,6 +203,10 @@ class AuthManager private constructor(private val appContext: Context) {
         }
     }
 
+    fun getValidAccessToken(): String = runBlocking(Dispatchers.IO) {
+        validAccessToken()
+    }
+
     suspend fun validAccessToken(): String {
         val token = prefs.getString(KEY_ACCESS_TOKEN, null)
         val expiryMs = prefs.getLong(KEY_EXPIRATION_MS, 0L)

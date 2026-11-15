@@ -1012,7 +1012,7 @@ private struct CoverFinderSheet: View {
             List {
                 Section {
                     HStack(spacing: 10) {
-                        TextField("Search show name…", text: $query)
+                        TextField("Search show or movie title…", text: $query)
                             .submitLabel(.search)
                             .onSubmit {
                                 Task { await runSearch() }
@@ -1029,7 +1029,7 @@ private struct CoverFinderSheet: View {
                 if isSearching {
                     HStack {
                         Spacer()
-                        ProgressView("Searching TVMaze & iTunes…")
+                        ProgressView("Searching Movies & TV Shows…")
                         Spacer()
                     }
                     .listRowBackground(Color.clear)
@@ -1037,7 +1037,7 @@ private struct CoverFinderSheet: View {
                     ContentUnavailableView(
                         "No Matches",
                         systemImage: "magnifyingglass",
-                        description: Text("Try a shorter or alternate show title.")
+                        description: Text("Try a shorter show or movie title.")
                     )
                     .listRowBackground(Color.clear)
                 } else {
@@ -1069,11 +1069,14 @@ private struct CoverFinderSheet: View {
                                             .foregroundStyle(.white)
 
                                         HStack(spacing: 6) {
-                                            if let year = result.year, !year.isEmpty {
-                                                Text(year)
-                                                    .font(.caption2)
-                                                    .foregroundStyle(.secondary)
-                                            }
+                                            Text(result.kindLabel)
+                                                .font(.caption2.bold())
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 2)
+                                                .background(result.isMovie ? Color.orange.opacity(0.22) : Color.purple.opacity(0.22))
+                                                .foregroundStyle(result.isMovie ? Color.orange : Color.purple)
+                                                .clipShape(Capsule())
+
                                             Text(result.source.label)
                                                 .font(.caption2.bold())
                                                 .padding(.horizontal, 6)
@@ -1097,7 +1100,7 @@ private struct CoverFinderSheet: View {
                     }
                 }
             }
-            .navigationTitle("Find Cover / Match Show")
+            .navigationTitle("Find Cover / Match")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {

@@ -4,6 +4,16 @@ struct ParsedMediaInfo: Hashable {
     let title: String
     let season: Int?
     let episode: Int?
+    let year: Int?
+    let isMovie: Bool
+
+    init(title: String, season: Int?, episode: Int?, year: Int? = nil, isMovie: Bool = false) {
+        self.title = title
+        self.season = season
+        self.episode = episode
+        self.year = year
+        self.isMovie = isMovie
+    }
 
     var isEpisode: Bool {
         season != nil && episode != nil
@@ -29,11 +39,13 @@ struct CoverSearchResult: Identifiable, Hashable {
     enum Source: Hashable {
         case tvMaze(showId: Int)
         case iTunes
+        case imdb
 
         var label: String {
             switch self {
             case .tvMaze: return "TVMaze"
             case .iTunes: return "iTunes"
+            case .imdb: return "IMDb"
             }
         }
     }
@@ -44,6 +56,33 @@ struct CoverSearchResult: Identifiable, Hashable {
     let year: String?
     let posterURL: URL?
     let summary: String?
+    let isMovie: Bool
+
+    init(
+        id: String,
+        source: Source,
+        title: String,
+        year: String?,
+        posterURL: URL?,
+        summary: String?,
+        isMovie: Bool = false
+    ) {
+        self.id = id
+        self.source = source
+        self.title = title
+        self.year = year
+        self.posterURL = posterURL
+        self.summary = summary
+        self.isMovie = isMovie
+    }
+
+    var kindLabel: String {
+        let base = isMovie ? "Movie" : "TV Series"
+        if let year, !year.isEmpty {
+            return "\(base) (\(year))"
+        }
+        return base
+    }
 }
 
 struct CustomCoverMatch: Codable, Equatable {
@@ -147,16 +186,32 @@ final class TMDBService {
                 if cleanedTitle.isEmpty {
                     cleanedTitle = cleanTitle(baseName)
                 }
-                return ParsedMediaInfo(title: cleanedTitle, season: season, episode: episode)
+                return ParsedMediaInfo(
+                    title: cleanedTitle,
+                    season: season,
+                    episode: episode,
+                    year: extractReleaseYear(rawPrefix).year,
+                    isMovie: false
+                )
             }
         }
 
-        var cleaned = cleanTitle(baseName)
+        let extracted = extractReleaseYear(baseName)
+        var cleaned = cleanTitle(extracted.titleWithoutYear)
+        if cleaned.isEmpty {
+            cleaned = cleanTitle(baseName)
+        }
         if isSeasonFolderName(cleaned) {
             cleaned = ""
         }
         let resolved = cleaned.isEmpty ? (validFolderHint ?? baseName) : cleaned
-        return ParsedMediaInfo(title: resolved, season: nil, episode: nil)
+        return ParsedMediaInfo(
+            title: resolved,
+            season: nil,
+            episode: nil,
+            year: extracted.year,
+            isMovie: true
+        )
     }
 
     func isSeasonOnlyTitle(_ title: String) -> Bool {
@@ -168,7 +223,12 @@ final class TMDBService {
         let driveThumb = file.thumbnailLink.flatMap(URL.init(string:))
         let showKey = normalizedShowKey(parsed.title)
 
-        let show = await resolveShow(query: parsed.title, showKey: showKey)
+        let show = await resolveShow(
+            query: parsed.title,
+            showKey: showKey,
+            isMovie: parsed.isMovie,
+            year: parsed.year
+        )
         if let show {
             var episodeTitle: String? = parsed.episodeCode
             var overview = show.summary
@@ -213,11 +273,20 @@ final class TMDBService {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
 
-        async let tvMazeResults = searchTVMaze(query: trimmed)
-        async let iTunesResults = searchITunes(query: trimmed)
+        let extracted = extractReleaseYear(trimmed)
+        let stripped = cleanTitle(extracted.titleWithoutYear)
+        let titleQuery = stripped.isEmpty ? trimmed : stripped
 
-        let (tvMaze, itunes) = await (tvMazeResults, iTunesResults)
-        return tvMaze + itunes
+        async let movieITunes = searchITunes(query: titleQuery, isMovie: true, year: extracted.year)
+        async let imdb = searchIMDbSuggestions(query: titleQuery, year: extracted.year)
+        async let tvMaze = searchTVMaze(query: titleQuery)
+        async let tvITunes = searchITunes(query: titleQuery, isMovie: false, year: nil)
+
+        let (movies, imdbResults, shows, showSeasons) = await (movieITunes, imdb, tvMaze, tvITunes)
+        if extracted.year != nil {
+            return movies + imdbResults + shows + showSeasons
+        }
+        return shows + movies + imdbResults + showSeasons
     }
 
     func applyCoverSelection(_ selection: CoverSearchResult, forShowTitle showTitle: String) async {
@@ -238,18 +307,27 @@ final class TMDBService {
                 saveCache()
             }
 
-        case .iTunes:
+        case .iTunes, .imdb:
             var existing = cache.manualBindings[showKey] ?? cache.shows[showKey]
-            if existing == nil {
+            if existing == nil && !selection.isMovie {
                 existing = await fetchTVMazeSingleShow(query: selection.title)
             }
             var bound = existing ?? CachedShow(
                 tvMazeId: nil,
-                name: showTitle,
+                name: selection.title.isEmpty ? showTitle : selection.title,
                 summary: selection.summary,
                 posterURL: selection.posterURL,
                 episodes: [:]
             )
+            if selection.isMovie {
+                bound.tvMazeId = nil
+            }
+            if !selection.title.isEmpty {
+                bound.name = selection.title
+            }
+            if let summary = selection.summary, !summary.isEmpty {
+                bound.summary = summary
+            }
             if let poster = selection.posterURL {
                 bound.posterURL = poster
             }
@@ -336,7 +414,12 @@ final class TMDBService {
 
     // MARK: - Resolution & Coalescing
 
-    private func resolveShow(query: String, showKey: String) async -> CachedShow? {
+    private func resolveShow(
+        query: String,
+        showKey: String,
+        isMovie: Bool = false,
+        year: Int? = nil
+    ) async -> CachedShow? {
         guard !showKey.isEmpty else { return nil }
         if let bound = cache.manualBindings[showKey] {
             return bound
@@ -351,21 +434,18 @@ final class TMDBService {
         let task = Task<CachedShow?, Never> {
             defer { inFlightLookups.removeValue(forKey: showKey) }
 
-            var resolved = await fetchTVMazeSingleShow(query: query)
-            if resolved?.posterURL == nil {
-                let itunes = await searchITunes(query: query)
-                if let firstArt = itunes.first?.posterURL {
-                    if resolved != nil {
-                        resolved?.posterURL = firstArt
-                    } else {
-                        resolved = CachedShow(
-                            tvMazeId: nil,
-                            name: query,
-                            summary: itunes.first?.summary,
-                            posterURL: firstArt,
-                            episodes: [:]
-                        )
-                    }
+            let resolved: CachedShow?
+            if isMovie {
+                if let movie = await resolveMovie(query: query, year: year) {
+                    resolved = movie
+                } else {
+                    resolved = await resolveTVShow(query: query)
+                }
+            } else {
+                if let show = await resolveTVShow(query: query) {
+                    resolved = show
+                } else {
+                    resolved = await resolveMovie(query: query, year: year)
                 }
             }
 
@@ -378,6 +458,82 @@ final class TMDBService {
 
         inFlightLookups[showKey] = task
         return await task.value
+    }
+
+    private func resolveTVShow(query: String) async -> CachedShow? {
+        var resolved = await fetchTVMazeSingleShow(query: query)
+        if resolved?.posterURL == nil {
+            let itunes = await searchITunes(query: query, isMovie: false)
+            let first = itunes.first(where: { $0.posterURL != nil }) ?? itunes.first
+            if let firstArt = first?.posterURL {
+                if resolved != nil {
+                    resolved?.posterURL = firstArt
+                } else {
+                    resolved = CachedShow(
+                        tvMazeId: nil,
+                        name: (first?.title.isEmpty == false ? first!.title : query),
+                        summary: first?.summary,
+                        posterURL: firstArt,
+                        episodes: [:]
+                    )
+                }
+            }
+        }
+        return resolved
+    }
+
+    private func resolveMovie(query: String, year: Int?) async -> CachedShow? {
+        let itunes = await searchITunes(query: query, isMovie: true, year: year)
+        let yearStr = year.map(String.init)
+        if let yearStr,
+           let exactItunes = itunes.first(where: { $0.year == yearStr && $0.posterURL != nil }),
+           let art = exactItunes.posterURL {
+            return CachedShow(
+                tvMazeId: nil,
+                name: exactItunes.title.isEmpty ? query : exactItunes.title,
+                summary: exactItunes.summary,
+                posterURL: art,
+                episodes: [:]
+            )
+        }
+
+        let imdb = await searchIMDbSuggestions(query: query, year: year)
+        let moviePreferred = imdb.filter { $0.isMovie }
+        let imdbPool = moviePreferred.isEmpty ? imdb : moviePreferred
+        if let yearStr,
+           let exactImdb = imdbPool.first(where: { $0.year == yearStr && $0.posterURL != nil }),
+           let art = exactImdb.posterURL {
+            return CachedShow(
+                tvMazeId: nil,
+                name: exactImdb.title.isEmpty ? query : exactImdb.title,
+                summary: exactImdb.summary,
+                posterURL: art,
+                episodes: [:]
+            )
+        }
+
+        if let best = pickBestMovieMatch(itunes, year: year) ?? pickBestMovieMatch(imdbPool, year: year),
+           let art = best.posterURL {
+            return CachedShow(
+                tvMazeId: nil,
+                name: best.title.isEmpty ? query : best.title,
+                summary: best.summary,
+                posterURL: art,
+                episodes: [:]
+            )
+        }
+        return nil
+    }
+
+    private func pickBestMovieMatch(_ results: [CoverSearchResult], year: Int?) -> CoverSearchResult? {
+        let withPoster = results.filter { $0.posterURL != nil }
+        if let year {
+            let yearStr = String(year)
+            if let yearMatch = withPoster.first(where: { $0.year == yearStr }) {
+                return yearMatch
+            }
+        }
+        return withPoster.first ?? results.first
     }
 
     // MARK: - TVMaze API
@@ -469,40 +625,152 @@ final class TMDBService {
         )
     }
 
-    // MARK: - iTunes Search API
+    // MARK: - iTunes & IMDb Search APIs
 
-    private func searchITunes(query: String) async -> [CoverSearchResult] {
+    private func searchITunes(query: String, isMovie: Bool, year: Int? = nil) async -> [CoverSearchResult] {
+        let termWithYear = (isMovie && year != nil) ? "\(query) \(year!)" : query
+        let primary = await executeITunesSearch(term: termWithYear, isMovie: isMovie)
+        if !primary.isEmpty || termWithYear == query {
+            return primary
+        }
+        return await executeITunesSearch(term: query, isMovie: isMovie)
+    }
+
+    private func executeITunesSearch(term: String, isMovie: Bool) async -> [CoverSearchResult] {
         var components = URLComponents(string: "https://itunes.apple.com/search")!
         components.queryItems = [
-            URLQueryItem(name: "term", value: query),
-            URLQueryItem(name: "media", value: "tvShow"),
-            URLQueryItem(name: "entity", value: "tvSeason"),
-            URLQueryItem(name: "limit", value: "8")
+            URLQueryItem(name: "term", value: term),
+            URLQueryItem(name: "media", value: isMovie ? "movie" : "tvShow"),
+            URLQueryItem(name: "entity", value: isMovie ? "movie" : "tvSeason"),
+            URLQueryItem(name: "limit", value: isMovie ? "5" : "8")
         ]
-        guard let url = components.url else { return [] }
+        if let url = components.url {
+            let primary = await fetchITunesResults(url: url, term: term, isMovie: isMovie, requireFeatureMovieKind: false)
+            if !primary.isEmpty || !isMovie {
+                return primary
+            }
+        }
 
+        // iTunes Search sometimes returns 0 for media=movie; retry general US catalog filtered to feature-movie.
+        var fallback = URLComponents(string: "https://itunes.apple.com/search")!
+        fallback.queryItems = [
+            URLQueryItem(name: "term", value: term),
+            URLQueryItem(name: "country", value: "us"),
+            URLQueryItem(name: "limit", value: "15")
+        ]
+        guard let fallbackURL = fallback.url else { return [] }
+        return await fetchITunesResults(url: fallbackURL, term: term, isMovie: true, requireFeatureMovieKind: true)
+    }
+
+    private func fetchITunesResults(
+        url: URL,
+        term: String,
+        isMovie: Bool,
+        requireFeatureMovieKind: Bool
+    ) async -> [CoverSearchResult] {
         do {
             let (data, response) = try await session.data(from: url)
             guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
                 return []
             }
             let decoded = try JSONDecoder().decode(ITunesSearchResponseDTO.self, from: data)
-            return decoded.results.compactMap { result in
+            let filtered = requireFeatureMovieKind
+                ? decoded.results.filter { $0.kind == "feature-movie" }
+                : decoded.results
+            return filtered.enumerated().map { index, result in
                 let rawArt = result.artworkUrl100 ?? result.artworkUrl60
-                let highResArt = rawArt?
-                    .replacingOccurrences(of: "100x100bb", with: "600x600bb")
-                    .replacingOccurrences(of: "60x60bb", with: "600x600bb")
+                let highResArt = rawArt?.replacingOccurrences(
+                    of: #"\d+x\d+bb"#,
+                    with: "600x900bb",
+                    options: .regularExpression
+                )
                 let posterURL = highResArt.flatMap(URL.init(string:))
                 let year = result.releaseDate.map { String($0.prefix(4)) }
-                let title = result.collectionName ?? result.artistName ?? query
-                let idSuffix = result.collectionId.map(String.init) ?? title
+                let title: String
+                if isMovie {
+                    title = result.trackName ?? result.collectionName ?? term
+                } else {
+                    title = result.collectionName ?? result.artistName ?? term
+                }
+                let idSuffix: String
+                if isMovie, let trackId = result.trackId {
+                    idSuffix = "movie-\(trackId)"
+                } else if let collectionId = result.collectionId {
+                    idSuffix = String(collectionId)
+                } else {
+                    idSuffix = "\(title)-\(index)"
+                }
+                let runtimeMin = result.trackTimeMillis.flatMap { $0 > 60_000 ? ($0 / 60_000) : nil }
+                let rawDesc = stripHTML(result.longDescription ?? result.shortDescription)
+                let summary: String?
+                switch (runtimeMin, rawDesc) {
+                case (let mins?, let desc?) where !desc.isEmpty:
+                    summary = "\(mins)m • \(desc)"
+                case (let mins?, _):
+                    summary = "\(mins)m"
+                case (nil, let desc):
+                    summary = desc
+                }
                 return CoverSearchResult(
                     id: "itunes-\(idSuffix)",
                     source: .iTunes,
                     title: title,
                     year: year,
                     posterURL: posterURL,
-                    summary: stripHTML(result.longDescription)
+                    summary: summary,
+                    isMovie: isMovie
+                )
+            }
+        } catch {
+            return []
+        }
+    }
+
+    private func searchIMDbSuggestions(query: String, year: Int? = nil) async -> [CoverSearchResult] {
+        let candidates = year != nil ? ["\(query) \(year!)", query] : [query]
+        for term in candidates {
+            let found = await executeIMDbSuggestionQuery(term: term)
+            if !found.isEmpty {
+                return found
+            }
+        }
+        return []
+    }
+
+    private func executeIMDbSuggestionQuery(term: String) async -> [CoverSearchResult] {
+        let slug = term.lowercased()
+            .replacingOccurrences(of: #"[^a-z0-9]+"#, with: "_", options: .regularExpression)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "_"))
+        guard let first = slug.first, ("a"..."z").contains(first) || ("0"..."9").contains(first) else {
+            return []
+        }
+        guard let url = URL(string: "https://v3.sg.media-imdb.com/suggestion/\(first)/\(slug).json") else {
+            return []
+        }
+
+        do {
+            let (data, response) = try await session.data(from: url)
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                return []
+            }
+            let decoded = try JSONDecoder().decode(IMDbSuggestionResponseDTO.self, from: data)
+            return decoded.d.prefix(8).compactMap { item in
+                guard let id = item.id, id.hasPrefix("tt"), let title = item.l, !title.isEmpty else {
+                    return nil
+                }
+                let posterURL = item.i?.imageUrl.flatMap(URL.init(string:))
+                let year = item.y.flatMap { $0 > 1800 ? String($0) : nil }
+                let qid = (item.qid ?? "").lowercased()
+                let qText = (item.q ?? "").lowercased()
+                let isMovie = qid != "tvseries" && qid != "tvminiseries" && !qText.contains("series")
+                return CoverSearchResult(
+                    id: "imdb-\(id)",
+                    source: .imdb,
+                    title: title,
+                    year: year,
+                    posterURL: posterURL,
+                    summary: item.s,
+                    isMovie: isMovie
                 )
             }
         } catch {
@@ -523,6 +791,44 @@ final class TMDBService {
         ) != nil
     }
 
+    private func extractReleaseYear(_ raw: String) -> (year: Int?, titleWithoutYear: String) {
+        let spaced = raw
+            .replacingOccurrences(of: ".", with: " ")
+            .replacingOccurrences(of: "_", with: " ")
+
+        if let parenRegex = try? NSRegularExpression(pattern: #"\(((?:19|20)\d{2})\)"#) {
+            let ns = spaced as NSString
+            let matches = parenRegex.matches(in: spaced, range: NSRange(location: 0, length: ns.length))
+            if let last = matches.last,
+               last.numberOfRanges >= 2,
+               let fullRange = Range(last.range(at: 0), in: spaced),
+               let yearRange = Range(last.range(at: 1), in: spaced),
+               let year = Int(spaced[yearRange]) {
+                let prefix = String(spaced[..<fullRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !prefix.isEmpty {
+                    return (year, prefix)
+                }
+            }
+        }
+
+        if let bareRegex = try? NSRegularExpression(pattern: #"\b((?:19|20)\d{2})\b"#) {
+            let ns = spaced as NSString
+            let matches = bareRegex.matches(in: spaced, range: NSRange(location: 0, length: ns.length))
+            if let last = matches.last(where: { $0.range.location > 0 }),
+               last.numberOfRanges >= 2,
+               let fullRange = Range(last.range(at: 0), in: spaced),
+               let yearRange = Range(last.range(at: 1), in: spaced),
+               let year = Int(spaced[yearRange]) {
+                let prefix = String(spaced[..<fullRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !prefix.isEmpty {
+                    return (year, prefix)
+                }
+            }
+        }
+
+        return (nil, spaced)
+    }
+
     private func cleanTitle(_ raw: String) -> String {
         var text = raw
             .replacingOccurrences(of: ".", with: " ")
@@ -531,7 +837,7 @@ final class TMDBService {
         let stripPatterns = [
             #"\[[^\]]*\]"#,
             #"\((?:19|20)\d{2}\)"#,
-            #"(?i)\b(2160p|1080p|720p|480p|4k|hdr|web-?dl|webrip|blu-?ray|bdrip|dvdrip|hdtv|x264|x265|hevc|h\.?264|h\.?265|aac|dts|atmos)\b.*"#
+            #"(?i)\b(2160p|1080p|720p|480p|4k|uhd|hdr|web-?dl|webrip|blu-?ray|brrip|bdrip|dvdrip|hdtv|x264|x265|hevc|h\.?264|h\.?265|aac|ac3|dts|atmos|remux|proper|repack|extended|unrated)\b.*"#
         ]
         for pattern in stripPatterns {
             text = text.replacingOccurrences(of: pattern, with: "", options: .regularExpression)
@@ -600,13 +906,34 @@ private struct TVMazeShowDTO: Decodable {
 
 private struct ITunesSearchResponseDTO: Decodable {
     struct ResultDTO: Decodable {
+        let kind: String?
+        let trackId: Int?
         let collectionId: Int?
         let artistName: String?
+        let trackName: String?
         let collectionName: String?
         let artworkUrl60: String?
         let artworkUrl100: String?
         let releaseDate: String?
+        let trackTimeMillis: Int?
+        let shortDescription: String?
         let longDescription: String?
     }
     let results: [ResultDTO]
+}
+
+private struct IMDbSuggestionResponseDTO: Decodable {
+    struct ImageDTO: Decodable {
+        let imageUrl: String?
+    }
+    struct ItemDTO: Decodable {
+        let id: String?
+        let l: String?
+        let q: String?
+        let qid: String?
+        let s: String?
+        let y: Int?
+        let i: ImageDTO?
+    }
+    let d: [ItemDTO]
 }

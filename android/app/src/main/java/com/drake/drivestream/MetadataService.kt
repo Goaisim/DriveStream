@@ -23,7 +23,9 @@ import java.util.concurrent.TimeUnit
 data class ParsedMediaInfo(
     val title: String,
     val season: Int?,
-    val episode: Int?
+    val episode: Int?,
+    val year: Int? = null,
+    val isMovie: Boolean = false
 ) {
     val isEpisode: Boolean
         get() = season != null && episode != null
@@ -49,11 +51,13 @@ data class ShowMetadata(
 sealed class CoverSource {
     data class TvMaze(val showId: Int) : CoverSource()
     data object ITunes : CoverSource()
+    data object IMDb : CoverSource()
 
     val label: String
         get() = when (this) {
             is TvMaze -> "TVMaze"
             is ITunes -> "iTunes"
+            is IMDb -> "IMDb"
         }
 }
 
@@ -63,8 +67,15 @@ data class CoverSearchResult(
     val title: String,
     val year: String?,
     val posterUrl: String?,
-    val summary: String?
-)
+    val summary: String?,
+    val isMovie: Boolean = false
+) {
+    val kindLabel: String
+        get() {
+            val base = if (isMovie) "Movie" else "TV Series"
+            return if (!year.isNullOrBlank()) "$base ($year)" else base
+        }
+}
 
 data class CustomCoverMatch(
     val posterUrl: String?,
@@ -278,13 +289,27 @@ class MetadataService private constructor(context: Context) {
             if (cleanedTitle.isEmpty()) {
                 cleanedTitle = cleanTitle(baseName)
             }
-            return ParsedMediaInfo(title = cleanedTitle, season = season, episode = episode)
+            return ParsedMediaInfo(
+                title = cleanedTitle,
+                season = season,
+                episode = episode,
+                year = extractReleaseYear(rawPrefix).first,
+                isMovie = false
+            )
         }
 
-        var cleaned = cleanTitle(baseName)
+        val (year, titleWithoutYear) = extractReleaseYear(baseName)
+        var cleaned = cleanTitle(titleWithoutYear)
+        if (cleaned.isEmpty()) cleaned = cleanTitle(baseName)
         if (isSeasonFolderName(cleaned)) cleaned = ""
         val resolved = if (cleaned.isEmpty()) (validFolderHint ?: baseName) else cleaned
-        return ParsedMediaInfo(title = resolved, season = null, episode = null)
+        return ParsedMediaInfo(
+            title = resolved,
+            season = null,
+            episode = null,
+            year = year,
+            isMovie = true
+        )
     }
 
     suspend fun metadata(file: DriveFile): ShowMetadata {
@@ -292,7 +317,12 @@ class MetadataService private constructor(context: Context) {
         val driveThumb = file.thumbnailLink
         val showKey = normalizedShowKey(parsed.title)
 
-        val show = resolveShow(parsed.title, showKey)
+        val show = resolveShow(
+            query = parsed.title,
+            showKey = showKey,
+            isMovie = parsed.isMovie,
+            year = parsed.year
+        )
         if (show != null) {
             var episodeTitle = parsed.episodeCode
             var overview = show.summary
@@ -332,10 +362,30 @@ class MetadataService private constructor(context: Context) {
     suspend fun searchShowCandidates(query: String): List<CoverSearchResult> = coroutineScope {
         val trimmed = query.trim()
         if (trimmed.isEmpty()) return@coroutineScope emptyList()
+        val (year, cleanQuery) = extractReleaseYear(trimmed)
+        val titleQuery = cleanTitle(cleanQuery).ifEmpty { trimmed }
 
-        val tvMazeDeferred = async(Dispatchers.IO) { searchTvMaze(trimmed) }
-        val iTunesDeferred = async(Dispatchers.IO) { searchITunes(trimmed) }
-        tvMazeDeferred.await() + iTunesDeferred.await()
+        val movieItunesDeferred = async(Dispatchers.IO) {
+            searchITunes(titleQuery, isMovie = true, year = year)
+        }
+        val imdbDeferred = async(Dispatchers.IO) {
+            searchIMDbSuggestions(titleQuery, year = year)
+        }
+        val tvMazeDeferred = async(Dispatchers.IO) {
+            searchTvMaze(titleQuery)
+        }
+        val tvItunesDeferred = async(Dispatchers.IO) {
+            searchITunes(titleQuery, isMovie = false, year = null)
+        }
+        val movieItunes = movieItunesDeferred.await()
+        val imdb = imdbDeferred.await()
+        val tvMaze = tvMazeDeferred.await()
+        val tvItunes = tvItunesDeferred.await()
+        if (year != null) {
+            movieItunes + imdb + tvMaze + tvItunes
+        } else {
+            tvMaze + movieItunes + imdb + tvItunes
+        }
     }
 
     suspend fun applyCoverSelection(selection: CoverSearchResult, showTitle: String) {
@@ -352,19 +402,26 @@ class MetadataService private constructor(context: Context) {
                 }
             }
 
-            is CoverSource.ITunes -> {
+            is CoverSource.ITunes, is CoverSource.IMDb -> {
                 val existing = synchronized(cacheLock) {
                     manualBindings[showKey] ?: showsCache[showKey]
-                } ?: withContext(Dispatchers.IO) { fetchTvMazeSingleShow(selection.title) }
+                } ?: if (!selection.isMovie) {
+                    withContext(Dispatchers.IO) { fetchTvMazeSingleShow(selection.title) }
+                } else {
+                    null
+                }
 
                 val base = existing ?: CachedShow(
                     tvMazeId = null,
-                    name = showTitle,
+                    name = selection.title.ifBlank { showTitle },
                     summary = selection.summary,
                     posterUrl = selection.posterUrl,
                     episodes = emptyMap()
                 )
                 base.copy(
+                    tvMazeId = if (selection.isMovie) null else base.tvMazeId,
+                    name = selection.title.ifBlank { base.name },
+                    summary = selection.summary ?: base.summary,
                     posterUrl = selection.posterUrl ?: base.posterUrl,
                     updatedAtSec = nowSec
                 )
@@ -456,7 +513,12 @@ class MetadataService private constructor(context: Context) {
         }
     }
 
-    private suspend fun resolveShow(query: String, showKey: String): CachedShow? {
+    private suspend fun resolveShow(
+        query: String,
+        showKey: String,
+        isMovie: Boolean = false,
+        year: Int? = null
+    ): CachedShow? {
         if (showKey.isEmpty()) return null
         synchronized(cacheLock) {
             manualBindings[showKey]?.let { return it }
@@ -484,21 +546,11 @@ class MetadataService private constructor(context: Context) {
 
         return try {
             val resolved = withContext(Dispatchers.IO) {
-                var show = fetchTvMazeSingleShow(query)
-                if (show?.posterUrl == null) {
-                    val itunes = searchITunes(query)
-                    val firstArt = itunes.firstOrNull()?.posterUrl
-                    if (firstArt != null) {
-                        show = show?.copy(posterUrl = firstArt) ?: CachedShow(
-                            tvMazeId = null,
-                            name = query,
-                            summary = itunes.firstOrNull()?.summary,
-                            posterUrl = firstArt,
-                            episodes = emptyMap()
-                        )
-                    }
+                if (isMovie) {
+                    resolveMovie(query, year) ?: resolveTvShow(query)
+                } else {
+                    resolveTvShow(query) ?: resolveMovie(query, year)
                 }
-                show
             }
             if (resolved != null) {
                 synchronized(cacheLock) {
@@ -518,6 +570,77 @@ class MetadataService private constructor(context: Context) {
                 }
             }
         }
+    }
+
+    private fun resolveTvShow(query: String): CachedShow? {
+        var show = fetchTvMazeSingleShow(query)
+        if (show?.posterUrl == null) {
+            val itunes = searchITunes(query, isMovie = false)
+            val first = itunes.firstOrNull { !it.posterUrl.isNullOrBlank() } ?: itunes.firstOrNull()
+            if (first?.posterUrl != null) {
+                show = show?.copy(posterUrl = first.posterUrl) ?: CachedShow(
+                    tvMazeId = null,
+                    name = first.title.ifBlank { query },
+                    summary = first.summary,
+                    posterUrl = first.posterUrl,
+                    episodes = emptyMap()
+                )
+            }
+        }
+        return show
+    }
+
+    private fun resolveMovie(query: String, year: Int?): CachedShow? {
+        val itunes = searchITunes(query, isMovie = true, year = year)
+        val yearStr = year?.toString()
+        if (yearStr != null) {
+            val exactItunes = itunes.firstOrNull { it.year == yearStr && !it.posterUrl.isNullOrBlank() }
+            if (exactItunes != null) {
+                return CachedShow(
+                    tvMazeId = null,
+                    name = exactItunes.title.ifBlank { query },
+                    summary = exactItunes.summary,
+                    posterUrl = exactItunes.posterUrl,
+                    episodes = emptyMap()
+                )
+            }
+        }
+
+        val imdb = searchIMDbSuggestions(query, year = year)
+        val imdbMovies = imdb.filter { it.isMovie }.ifEmpty { imdb }
+        if (yearStr != null) {
+            val exactImdb = imdbMovies.firstOrNull { it.year == yearStr && !it.posterUrl.isNullOrBlank() }
+            if (exactImdb != null) {
+                return CachedShow(
+                    tvMazeId = null,
+                    name = exactImdb.title.ifBlank { query },
+                    summary = exactImdb.summary,
+                    posterUrl = exactImdb.posterUrl,
+                    episodes = emptyMap()
+                )
+            }
+        }
+
+        val best = pickBestMovieMatch(itunes, year) ?: pickBestMovieMatch(imdbMovies, year)
+        if (best?.posterUrl != null) {
+            return CachedShow(
+                tvMazeId = null,
+                name = best.title.ifBlank { query },
+                summary = best.summary,
+                posterUrl = best.posterUrl,
+                episodes = emptyMap()
+            )
+        }
+        return null
+    }
+
+    private fun pickBestMovieMatch(results: List<CoverSearchResult>, year: Int?): CoverSearchResult? {
+        val withPoster = results.filter { !it.posterUrl.isNullOrBlank() }
+        if (year != null) {
+            val yearStr = year.toString()
+            withPoster.firstOrNull { it.year == yearStr }?.let { return it }
+        }
+        return withPoster.firstOrNull() ?: results.firstOrNull()
     }
 
     private fun fetchTvMazeSingleShow(query: String): CachedShow? {
@@ -569,35 +692,131 @@ class MetadataService private constructor(context: Context) {
         }.getOrDefault(emptyList())
     }
 
-    private fun searchITunes(query: String): List<CoverSearchResult> {
+    private fun searchITunes(query: String, isMovie: Boolean, year: Int? = null): List<CoverSearchResult> {
+        val termWithYear = if (isMovie && year != null) "$query $year" else query
+        val primary = executeITunesSearch(termWithYear, isMovie)
+        if (primary.isNotEmpty() || termWithYear == query) return primary
+        return executeITunesSearch(query, isMovie)
+    }
+
+    private fun executeITunesSearch(term: String, isMovie: Boolean): List<CoverSearchResult> {
         val url = "https://itunes.apple.com/search".toHttpUrl().newBuilder()
-            .addQueryParameter("term", query)
-            .addQueryParameter("media", "tvShow")
-            .addQueryParameter("entity", "tvSeason")
-            .addQueryParameter("limit", "8")
+            .addQueryParameter("term", term)
+            .addQueryParameter("media", if (isMovie) "movie" else "tvShow")
+            .addQueryParameter("entity", if (isMovie) "movie" else "tvSeason")
+            .addQueryParameter("limit", if (isMovie) "5" else "8")
             .build()
-        val body = httpGetString(url.toString()) ?: return emptyList()
+        val body = httpGetString(url.toString())
+        val parsed = body?.let { parseITunesResults(it, term, isMovie, requireFeatureMovieKind = false) }.orEmpty()
+        if (parsed.isNotEmpty() || !isMovie) return parsed
+
+        // iTunes Search sometimes returns 0 for media=movie; retry general US catalog filtered to feature-movie.
+        val fallbackUrl = "https://itunes.apple.com/search".toHttpUrl().newBuilder()
+            .addQueryParameter("term", term)
+            .addQueryParameter("country", "us")
+            .addQueryParameter("limit", "15")
+            .build()
+        val fallbackBody = httpGetString(fallbackUrl.toString()) ?: return emptyList()
+        return parseITunesResults(fallbackBody, term, isMovie = true, requireFeatureMovieKind = true)
+    }
+
+    private fun parseITunesResults(
+        body: String,
+        term: String,
+        isMovie: Boolean,
+        requireFeatureMovieKind: Boolean
+    ): List<CoverSearchResult> {
         return runCatching {
             val results = JSONObject(body).optJSONArray("results") ?: return emptyList()
             buildList {
                 for (i in 0 until results.length()) {
                     val obj = results.optJSONObject(i) ?: continue
+                    if (requireFeatureMovieKind && obj.optNonBlank("kind") != "feature-movie") continue
                     val rawArt = obj.optNonBlank("artworkUrl100") ?: obj.optNonBlank("artworkUrl60")
-                    val highResArt = rawArt
-                        ?.replace("100x100bb", "600x600bb")
-                        ?.replace("60x60bb", "600x600bb")
+                    val highResArt = rawArt?.replace(Regex("""\d+x\d+bb"""), "600x900bb")
                     val year = obj.optNonBlank("releaseDate")?.take(4)
-                    val title = obj.optNonBlank("collectionName") ?: obj.optNonBlank("artistName") ?: query
-                    val collectionId = if (obj.has("collectionId")) obj.optLong("collectionId").toString() else title
-                    val summary = stripHtml(obj.optNonBlank("longDescription"))
+                    val title = if (isMovie) {
+                        obj.optNonBlank("trackName") ?: obj.optNonBlank("collectionName") ?: term
+                    } else {
+                        obj.optNonBlank("collectionName") ?: obj.optNonBlank("artistName") ?: term
+                    }
+                    val itemId = if (isMovie && obj.has("trackId")) {
+                        "movie-${obj.optLong("trackId")}"
+                    } else if (obj.has("collectionId")) {
+                        obj.optLong("collectionId").toString()
+                    } else {
+                        "${title}-${i}"
+                    }
+                    val runtimeMin = obj.optLong("trackTimeMillis", 0L).let { ms ->
+                        if (ms > 60_000L) (ms / 60_000L).toInt() else null
+                    }
+                    val rawDesc = stripHtml(obj.optNonBlank("longDescription") ?: obj.optNonBlank("shortDescription"))
+                    val summary = when {
+                        runtimeMin != null && !rawDesc.isNullOrBlank() -> "${runtimeMin}m • $rawDesc"
+                        runtimeMin != null -> "${runtimeMin}m"
+                        else -> rawDesc
+                    }
                     add(
                         CoverSearchResult(
-                            id = "itunes-$collectionId",
+                            id = "itunes-$itemId",
                             source = CoverSource.ITunes,
                             title = title,
                             year = year,
                             posterUrl = highResArt,
-                            summary = summary
+                            summary = summary,
+                            isMovie = isMovie
+                        )
+                    )
+                }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    private fun searchIMDbSuggestions(query: String, year: Int? = null): List<CoverSearchResult> {
+        val candidates = if (year != null) {
+            listOf("$query $year", query)
+        } else {
+            listOf(query)
+        }
+        for (term in candidates) {
+            val found = executeIMDbSuggestionQuery(term)
+            if (found.isNotEmpty()) return found
+        }
+        return emptyList()
+    }
+
+    private fun executeIMDbSuggestionQuery(term: String): List<CoverSearchResult> {
+        val slug = term.lowercase(Locale.US)
+            .replace(Regex("""[^a-z0-9]+"""), "_")
+            .trim('_')
+        val firstChar = slug.firstOrNull()?.takeIf { it in 'a'..'z' || it in '0'..'9' } ?: return emptyList()
+        val url = "https://v3.sg.media-imdb.com/suggestion/$firstChar/$slug.json"
+        val body = httpGetString(url) ?: return emptyList()
+        return runCatching {
+            val arr = JSONObject(body).optJSONArray("d") ?: return emptyList()
+            buildList {
+                val limit = minOf(arr.length(), 8)
+                for (i in 0 until limit) {
+                    val obj = arr.optJSONObject(i) ?: continue
+                    val id = obj.optNonBlank("id") ?: continue
+                    if (!id.startsWith("tt")) continue
+                    val title = obj.optNonBlank("l") ?: continue
+                    val imageUrl = obj.optJSONObject("i")?.optNonBlank("imageUrl")
+                    val year = if (obj.has("y") && !obj.isNull("y")) obj.optInt("y").takeIf { it > 1800 }?.toString() else null
+                    val qid = obj.optNonBlank("qid").orEmpty().lowercase(Locale.US)
+                    val qText = obj.optNonBlank("q").orEmpty().lowercase(Locale.US)
+                    val isMovie = qid != "tvseries" && qid != "tvminiseries" &&
+                        !qText.contains("series")
+                    val castOrType = obj.optNonBlank("s")
+                    add(
+                        CoverSearchResult(
+                            id = "imdb-$id",
+                            source = CoverSource.IMDb,
+                            title = title,
+                            year = year,
+                            posterUrl = imageUrl,
+                            summary = castOrType,
+                            isMovie = isMovie
                         )
                     )
                 }
@@ -648,6 +867,26 @@ class MetadataService private constructor(context: Context) {
 
     private fun isSeasonFolderName(name: String): Boolean {
         return SEASON_NAME_REGEX.matches(name)
+    }
+
+    private fun extractReleaseYear(raw: String): Pair<Int?, String> {
+        val spaced = raw.replace('.', ' ').replace('_', ' ')
+        val parenMatch = PAREN_YEAR_REGEX.findAll(spaced).lastOrNull()
+        if (parenMatch != null) {
+            val year = parenMatch.groupValues[1].toIntOrNull()
+            val prefix = spaced.substring(0, parenMatch.range.first).trim()
+            if (prefix.isNotEmpty()) {
+                return year to prefix
+            }
+        }
+        val bareMatch = BARE_YEAR_REGEX.findAll(spaced).lastOrNull { it.range.first > 0 }
+        if (bareMatch != null) {
+            val before = spaced.substring(0, bareMatch.range.first).trim()
+            if (before.isNotEmpty()) {
+                return bareMatch.groupValues[1].toIntOrNull() to before
+            }
+        }
+        return null to spaced
     }
 
     private fun cleanTitle(raw: String): String {
@@ -780,11 +1019,14 @@ class MetadataService private constructor(context: Context) {
             RegexOption.IGNORE_CASE
         )
 
+        private val PAREN_YEAR_REGEX = Regex("""\(((?:19|20)\d{2})\)""")
+        private val BARE_YEAR_REGEX = Regex("""\b((?:19|20)\d{2})\b""")
+
         private val TITLE_STRIP_PATTERNS = listOf(
             Regex("""\[[^\]]*]"""),
             Regex("""\((?:19|20)\d{2}\)"""),
             Regex(
-                """\b(2160p|1080p|720p|480p|4k|hdr|web-?dl|webrip|blu-?ray|bdrip|dvdrip|hdtv|x264|x265|hevc|h\.?264|h\.?265|aac|dts|atmos)\b.*""",
+                """\b(2160p|1080p|720p|480p|4k|uhd|hdr|web-?dl|webrip|blu-?ray|brrip|bdrip|dvdrip|hdtv|x264|x265|hevc|h\.?264|h\.?265|aac|ac3|dts|atmos|remux|proper|repack|extended|unrated)\b.*""",
                 RegexOption.IGNORE_CASE
             )
         )

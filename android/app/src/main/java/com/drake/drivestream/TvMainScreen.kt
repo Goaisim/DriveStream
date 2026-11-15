@@ -78,9 +78,12 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -98,6 +101,23 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.util.Locale
+
+private val QUICK_TEST_LINKS = listOf(
+    SavedLink(id = "quick-google", title = "Google", urlString = "https://www.google.com"),
+    SavedLink(id = "quick-duckduckgo", title = "DuckDuckGo", urlString = "https://duckduckgo.com"),
+    SavedLink(id = "quick-bing", title = "Bing", urlString = "https://www.bing.com")
+)
+
+private fun suggestTitleFromUrl(rawUrl: String): String {
+    val host = SavedLinksManager.validHttpUri(rawUrl)?.host?.lowercase(Locale.US)
+        ?.removePrefix("www.")
+        .orEmpty()
+    if (host.isEmpty()) return ""
+    val primary = host.substringBefore('.')
+    return primary.replaceFirstChar { ch ->
+        if (ch.isLowerCase()) ch.titlecase(Locale.US) else ch.toString()
+    }
+}
 
 // MARK: - Library Models & ViewModel
 
@@ -455,6 +475,11 @@ fun TvMainScreen(libraryViewModel: LibraryViewModel = viewModel()) {
                         syncManager.scheduleSyncAfterChange()
                         activeWebLink = saved
                     }
+                },
+                onQuickOpen = { quickLink ->
+                    showAddEditDialog = false
+                    editingLink = null
+                    activeWebLink = quickLink
                 }
             )
         }
@@ -792,29 +817,39 @@ private fun TvHomeContent(
                     }
                 }
 
-                // Web Links Row
-                if (savedLinks.isNotEmpty()) {
-                    item(key = "web-links-header") {
-                        Text(
-                            text = "Web Links  (Hold OK / Menu for Edit & Delete)",
-                            color = Color.White,
-                            fontSize = 20.sp,
-                            fontWeight = FontWeight.Bold,
-                            modifier = Modifier.padding(horizontal = 36.dp)
-                        )
-                    }
-                    item(key = "web-links-row") {
-                        LazyRow(
-                            contentPadding = PaddingValues(horizontal = 36.dp),
-                            horizontalArrangement = Arrangement.spacedBy(16.dp)
-                        ) {
-                            items(savedLinks, key = { it.id }) { link ->
-                                SavedLinkTvCard(
-                                    link = link,
-                                    onClick = { onOpenLink(link) },
-                                    onLongClick = { onLongPressLink(link) }
-                                )
-                            }
+                // Web Links + Quick Test Browser Row (always visible so Ad-Block WebView can be tested in 1 click)
+                item(key = "web-links-header") {
+                    Text(
+                        text = if (savedLinks.isNotEmpty()) {
+                            "Web Links  (Hold OK / Menu for Edit & Delete)"
+                        } else {
+                            "Web Links & Quick Test Browser"
+                        },
+                        color = Color.White,
+                        fontSize = 20.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 36.dp)
+                    )
+                }
+                item(key = "web-links-row") {
+                    LazyRow(
+                        contentPadding = PaddingValues(horizontal = 36.dp),
+                        horizontalArrangement = Arrangement.spacedBy(16.dp)
+                    ) {
+                        items(savedLinks, key = { it.id }) { link ->
+                            SavedLinkTvCard(
+                                link = link,
+                                onClick = { onOpenLink(link) },
+                                onLongClick = { onLongPressLink(link) }
+                            )
+                        }
+                        items(QUICK_TEST_LINKS, key = { it.id }) { quick ->
+                            SavedLinkTvCard(
+                                link = quick,
+                                subtitleText = "Quick Test • ${quick.displayDomain}",
+                                onClick = { onOpenLink(quick) },
+                                onLongClick = null
+                            )
                         }
                     }
                 }
@@ -890,9 +925,37 @@ private fun TvHomeContent(
                         }
                     }
                 }
+                if (!isLoading && items.isEmpty() && errorMessage == null) {
+                    item(key = "empty-library-hint") {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 36.dp, vertical = 20.dp)
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(Color(0xFF141621))
+                                .padding(24.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(Icons.Default.Tv, contentDescription = null, tint = Color(0xFF6B7280), modifier = Modifier.size(40.dp))
+                            Text(
+                                text = if (isAuthenticated) "No Google Drive Videos Yet" else "Signed Out (Web Links & Quick Test Ready Above)",
+                                color = Color.White,
+                                fontSize = 17.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = "Press Add Link above or open $companionUrl from your phone or PC.",
+                                color = Color(0xFF9CA3AF),
+                                fontSize = 14.sp,
+                                textAlign = TextAlign.Center
+                            )
+                        }
+                    }
+                }
             }
 
-            if (isLoading && items.isEmpty() && savedLinks.isEmpty()) {
+            if (isLoading && items.isEmpty()) {
                 Column(
                     modifier = Modifier.align(Alignment.Center),
                     horizontalAlignment = Alignment.CenterHorizontally,
@@ -900,26 +963,6 @@ private fun TvHomeContent(
                 ) {
                     CircularProgressIndicator(color = Color(0xFF3B82F6))
                     Text("Scanning Google Drive…", color = Color(0xFF9CA3AF), fontSize = 15.sp)
-                }
-            } else if (!isLoading && items.isEmpty() && savedLinks.isEmpty() && errorMessage == null) {
-                Column(
-                    modifier = Modifier.align(Alignment.Center),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Icon(Icons.Default.Tv, contentDescription = null, tint = Color(0xFF6B7280), modifier = Modifier.size(48.dp))
-                    Text(
-                        text = if (isAuthenticated) "No Videos or Web Links Yet" else "No Web Links Added Yet",
-                        color = Color.White,
-                        fontSize = 18.sp,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                    Text(
-                        text = "Press Add Link above or open $companionUrl from your phone or PC.",
-                        color = Color(0xFF9CA3AF),
-                        fontSize = 14.sp,
-                        textAlign = TextAlign.Center
-                    )
                 }
             }
         }
@@ -933,7 +976,8 @@ private fun TvHomeContent(
 private fun SavedLinkTvCard(
     link: SavedLink,
     onClick: () -> Unit,
-    onLongClick: () -> Unit
+    onLongClick: (() -> Unit)? = null,
+    subtitleText: String = link.displayDomain
 ) {
     var focused by remember { mutableStateOf(false) }
     Column(
@@ -949,7 +993,7 @@ private fun SavedLinkTvCard(
             )
             .onFocusChanged { focused = it.isFocused }
             .onPreviewKeyEvent { ev ->
-                if (ev.type == KeyEventType.KeyDown && ev.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_MENU) {
+                if (onLongClick != null && ev.type == KeyEventType.KeyDown && ev.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_MENU) {
                     onLongClick()
                     true
                 } else false
@@ -1008,7 +1052,7 @@ private fun SavedLinkTvCard(
                 overflow = TextOverflow.Ellipsis
             )
             Text(
-                text = link.displayDomain,
+                text = subtitleText,
                 color = Color(0xFF9CA3AF),
                 fontSize = 12.sp,
                 maxLines = 1,
@@ -1392,51 +1436,251 @@ private fun AddEditLinkTvDialog(
     existingLink: SavedLink?,
     onDismiss: () -> Unit,
     onSave: (String, String) -> Unit,
-    onSaveAndOpen: (String, String) -> Unit
+    onSaveAndOpen: (String, String) -> Unit,
+    onQuickOpen: (SavedLink) -> Unit
 ) {
-    var title by remember(existingLink) { mutableStateOf(existingLink?.title ?: "") }
     var url by remember(existingLink) { mutableStateOf(existingLink?.urlString ?: "") }
-    val validUri = SavedLinksManager.validHttpUri(url)
+    var title by remember(existingLink) { mutableStateOf(existingLink?.title ?: "") }
+    var editingField by remember { mutableStateOf<String?>(null) }
+    var focusSaveAndOpenPending by remember { mutableStateOf(false) }
 
-    BackHandler { onDismiss() }
+    val urlButtonFocus = remember { FocusRequester() }
+    val saveAndOpenFocus = remember { FocusRequester() }
+    val validUri = SavedLinksManager.validHttpUri(url)
+    val autoTitle = suggestTitleFromUrl(url)
+
+    LaunchedEffect(Unit) {
+        delay(60L)
+        runCatching { urlButtonFocus.requestFocus() }
+    }
+
+    LaunchedEffect(editingField, focusSaveAndOpenPending) {
+        if (editingField == null && focusSaveAndOpenPending) {
+            focusSaveAndOpenPending = false
+            delay(60L)
+            runCatching { saveAndOpenFocus.requestFocus() }
+        }
+    }
+
+    BackHandler {
+        if (editingField != null) {
+            editingField = null
+        } else {
+            onDismiss()
+        }
+    }
 
     TvDialogSurface(
         title = if (existingLink == null) "Add Web Link" else "Edit Web Link",
-        onDismiss = onDismiss
+        onDismiss = onDismiss,
+        maxWidthFraction = 0.62f
     ) {
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            TvTextInput(
-                label = "Title (optional)",
-                value = title,
-                onValueChange = { title = it }
+            TvDialogFieldButton(
+                label = "Enter Website URL",
+                value = if (url.isBlank()) "Press OK to type a domain (e.g. google.com)" else url,
+                isPlaceholder = url.isBlank(),
+                modifier = Modifier.focusRequester(urlButtonFocus),
+                onClick = { editingField = "url" }
             )
-            TvTextInput(
-                label = "URL (e.g. example.com)",
-                value = url,
-                onValueChange = { url = it }
+
+            TvDialogFieldButton(
+                label = "Website Title (Optional)",
+                value = when {
+                    title.isNotBlank() -> title
+                    autoTitle.isNotEmpty() -> "Auto: $autoTitle"
+                    else -> "Press OK to enter custom title"
+                },
+                isPlaceholder = title.isBlank(),
+                onClick = { editingField = "title" }
             )
+
             Text(
-                text = if (validUri != null) "Saves as $validUri" else "Enter any domain or URL (https:// added automatically).",
+                text = if (validUri != null) {
+                    "Saves as $validUri"
+                } else {
+                    "Select Enter Website URL above, or launch a Quick Test Browser site below."
+                },
                 color = Color(0xFF9CA3AF),
                 fontSize = 12.sp
             )
-            Spacer(Modifier.height(4.dp))
+
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 TvActionButton(
-                    label = "Save & Open",
+                    label = "Save & Open in Ad-Block Browser",
                     icon = Icons.Default.PlayArrow,
                     isPrimary = true,
                     enabled = validUri != null,
-                    onClick = { onSaveAndOpen(title, url) }
+                    modifier = Modifier.focusRequester(saveAndOpenFocus),
+                    onClick = { onSaveAndOpen(title.ifBlank { autoTitle }, url) }
                 )
                 TvActionButton(
                     label = "Save",
                     enabled = validUri != null,
-                    onClick = { onSave(title, url) }
+                    onClick = { onSave(title.ifBlank { autoTitle }, url) }
                 )
                 TvActionButton(
                     label = "Cancel",
                     onClick = onDismiss
+                )
+            }
+
+            Spacer(Modifier.height(2.dp))
+            Text(
+                text = "Quick Test Browser (No Typing):",
+                color = Color(0xFF9CA3AF),
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                QUICK_TEST_LINKS.forEach { quick ->
+                    TvActionButton(
+                        label = quick.title,
+                        icon = Icons.Default.Public,
+                        onClick = { onQuickOpen(quick) }
+                    )
+                }
+            }
+        }
+    }
+
+    when (editingField) {
+        "url" -> SingleFieldTvInputDialog(
+            title = "Enter Website URL",
+            label = "Website URL or Domain (https:// added automatically)",
+            initialValue = url,
+            keyboardType = KeyboardType.Uri,
+            onDismiss = { editingField = null },
+            onConfirm = { entered ->
+                val trimmed = entered.trim()
+                url = trimmed
+                if (title.isBlank()) {
+                    val suggested = suggestTitleFromUrl(trimmed)
+                    if (suggested.isNotEmpty()) {
+                        title = suggested
+                    }
+                }
+                editingField = null
+                if (SavedLinksManager.validHttpUri(trimmed) != null) {
+                    focusSaveAndOpenPending = true
+                }
+            }
+        )
+
+        "title" -> SingleFieldTvInputDialog(
+            title = "Website Title (Optional)",
+            label = "Display Title",
+            initialValue = title,
+            keyboardType = KeyboardType.Text,
+            onDismiss = { editingField = null },
+            onConfirm = { entered ->
+                title = entered.trim()
+                editingField = null
+            }
+        )
+    }
+}
+
+@Composable
+private fun TvDialogFieldButton(
+    label: String,
+    value: String,
+    isPlaceholder: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+    var focused by remember { mutableStateOf(false) }
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(if (focused) Color(0xFF1D243B) else Color(0xFF0A0B12))
+            .border(
+                width = if (focused) 2.5.dp else 1.dp,
+                color = if (focused) Color.White else Color.White.copy(alpha = 0.16f),
+                shape = RoundedCornerShape(10.dp)
+            )
+            .onFocusChanged { focused = it.isFocused }
+            .focusable()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(3.dp)
+    ) {
+        Text(label, color = if (focused) Color(0xFF93C5FD) else Color(0xFF9CA3AF), fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+        Text(
+            text = value,
+            color = if (isPlaceholder) Color(0xFF6B7280) else Color.White,
+            fontSize = 15.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+@Composable
+private fun SingleFieldTvInputDialog(
+    title: String,
+    label: String,
+    initialValue: String,
+    keyboardType: KeyboardType,
+    onDismiss: () -> Unit,
+    onConfirm: (String) -> Unit
+) {
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val focusManager = LocalFocusManager.current
+    val inputFocus = remember { FocusRequester() }
+    var draft by remember(initialValue) { mutableStateOf(initialValue) }
+
+    fun finishSubmit() {
+        keyboardController?.hide()
+        focusManager.clearFocus()
+        onConfirm(draft)
+    }
+
+    LaunchedEffect(Unit) {
+        delay(80L)
+        runCatching {
+            inputFocus.requestFocus()
+            keyboardController?.show()
+        }
+    }
+
+    BackHandler {
+        keyboardController?.hide()
+        onDismiss()
+    }
+
+    TvDialogSurface(
+        title = title,
+        onDismiss = {
+            keyboardController?.hide()
+            onDismiss()
+        },
+        maxWidthFraction = 0.56f
+    ) {
+        Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            TvTextInput(
+                label = label,
+                value = draft,
+                onValueChange = { draft = it },
+                keyboardType = keyboardType,
+                imeAction = ImeAction.Done,
+                inputFocusRequester = inputFocus,
+                onSubmit = { finishSubmit() }
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                TvActionButton(
+                    label = "Done",
+                    icon = Icons.Default.PlayArrow,
+                    isPrimary = true,
+                    onClick = { finishSubmit() }
+                )
+                TvActionButton(
+                    label = "Cancel",
+                    onClick = {
+                        keyboardController?.hide()
+                        onDismiss()
+                    }
                 )
             }
         }
@@ -1517,7 +1761,7 @@ private fun CoverFinderTvDialog(
     BackHandler { onDismiss() }
 
     TvDialogSurface(
-        title = "Find Cover / Match Show",
+        title = "Find Cover / Match",
         onDismiss = onDismiss,
         maxWidthFraction = 0.68f,
         maxHeightFraction = 0.82f
@@ -1526,7 +1770,7 @@ private fun CoverFinderTvDialog(
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
                 Box(modifier = Modifier.weight(1f)) {
                     TvTextInput(
-                        label = "Search show title…",
+                        label = "Search show or movie title…",
                         value = query,
                         onValueChange = { query = it },
                         onSubmit = { runSearch() }
@@ -1545,7 +1789,7 @@ private fun CoverFinderTvDialog(
                     CircularProgressIndicator(color = Color(0xFF3B82F6))
                 }
             } else if (results.isEmpty()) {
-                Text("No matches found. Try a shorter show title.", color = Color(0xFF9CA3AF), fontSize = 14.sp)
+                Text("No matches found. Try a shorter show or movie title.", color = Color(0xFF9CA3AF), fontSize = 14.sp)
             } else {
                 LazyColumn(
                     modifier = Modifier.weight(1f, fill = false),
@@ -1592,8 +1836,13 @@ private fun CoverFinderTvDialog(
                             }
                             Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                 Text(result.title, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    result.year?.let { Text(it, color = Color(0xFF9CA3AF), fontSize = 12.sp) }
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        text = result.kindLabel,
+                                        color = if (result.isMovie) Color(0xFFFDBA74) else Color(0xFFC4B5FD),
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
                                     Text(result.source.label, color = Color(0xFF60A5FA), fontSize = 12.sp, fontWeight = FontWeight.Bold)
                                 }
                                 result.summary?.let {
@@ -1781,7 +2030,10 @@ private fun TvTextInput(
     label: String,
     value: String,
     onValueChange: (String) -> Unit,
-    onSubmit: (() -> Unit)? = null
+    onSubmit: (() -> Unit)? = null,
+    keyboardType: KeyboardType = KeyboardType.Text,
+    imeAction: ImeAction = if (onSubmit != null) ImeAction.Search else ImeAction.Done,
+    inputFocusRequester: FocusRequester? = null
 ) {
     var focused by remember { mutableStateOf(false) }
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -1798,20 +2050,38 @@ private fun TvTextInput(
                 )
                 .padding(horizontal = 14.dp, vertical = 12.dp)
         ) {
+            val baseModifier = Modifier
+                .fillMaxWidth()
+                .let { mod -> if (inputFocusRequester != null) mod.focusRequester(inputFocusRequester) else mod }
+                .onFocusChanged { focused = it.isFocused }
+                .onPreviewKeyEvent { ev ->
+                    if (
+                        onSubmit != null &&
+                        ev.type == KeyEventType.KeyDown &&
+                        ev.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_ENTER
+                    ) {
+                        onSubmit()
+                        true
+                    } else {
+                        false
+                    }
+                }
             BasicTextField(
                 value = value,
                 onValueChange = onValueChange,
                 singleLine = true,
                 textStyle = TextStyle(color = Color.White, fontSize = 15.sp),
                 cursorBrush = SolidColor(Color(0xFF3B82F6)),
-                keyboardOptions = KeyboardOptions(imeAction = if (onSubmit != null) ImeAction.Search else ImeAction.Done),
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = keyboardType,
+                    imeAction = imeAction
+                ),
                 keyboardActions = KeyboardActions(
                     onSearch = { onSubmit?.invoke() },
-                    onDone = { onSubmit?.invoke() }
+                    onDone = { onSubmit?.invoke() },
+                    onNext = { onSubmit?.invoke() }
                 ),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .onFocusChanged { focused = it.isFocused }
+                modifier = baseModifier
             )
         }
     }

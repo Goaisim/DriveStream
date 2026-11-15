@@ -51,6 +51,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableDoubleStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -105,7 +106,8 @@ fun VlcPlayerScreen(
 ) {
     val context = LocalContext.current
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
-    val proxy = remember(context) { LocalStreamProxy.getInstance(context).also { it.start() } }
+    val proxy = remember(context) { LocalStreamProxy.getInstance(context).also { it.ensureStarted() } }
+    val proxyStatus by proxy.lastProxyStatus.collectAsState()
     val playbackStore = remember(context) { PlaybackStore.getInstance(context) }
     val syncManager = remember(context) { SyncManager.getInstance(context) }
 
@@ -128,6 +130,9 @@ fun VlcPlayerScreen(
     var preferredSubtitleTrackId by remember { mutableIntStateOf(-1) }
 
     var userToggledSubtitles by remember { mutableStateOf(false) }
+    var didDisableInitialSubtitles by remember { mutableStateOf(false) }
+    var didStartInitialPlayback by remember { mutableStateOf(false) }
+    var isPlayerDisposed by remember { mutableStateOf(false) }
     var didAttemptResume by remember { mutableStateOf(false) }
     var seekIgnoreUntilMs by remember { mutableLongStateOf(0L) }
     var lastSavedAtMs by remember { mutableLongStateOf(0L) }
@@ -148,13 +153,12 @@ fun VlcPlayerScreen(
         LibVLC(
             context,
             arrayListOf(
-                "--network-caching=1500",
-                "--http-reconnect"
+                "--network-caching=2000",
+                "--no-sub-autodetect-file"
             )
         )
     }
     val mediaPlayer = remember(libVlc) { MediaPlayer(libVlc) }
-    val videoLayout = remember(context) { VLCVideoLayout(context) }
 
     val currentIndex = queue.indexOfFirst { it.id == currentEpisode.id }
     val hasPrev = currentIndex > 0
@@ -252,15 +256,22 @@ fun VlcPlayerScreen(
         currentSubtitleTrackId = -1
         preferredSubtitleTrackId = -1
         userToggledSubtitles = false
+        didDisableInitialSubtitles = false
         didAttemptResume = false
         seekIgnoreUntilMs = 0L
         errorMessage = null
         statusMessage = "Connecting to Drive proxy…"
 
+        if (!proxy.ensureStarted()) {
+            isLoading = false
+            errorMessage = proxy.lastProxyStatus.value
+            return
+        }
+
         val streamUri = Uri.parse(proxy.streamUrl(episode.id))
         val media = Media(libVlc, streamUri).apply {
-            addOption(":network-caching=1500")
-            addOption(":http-reconnect")
+            addOption(":network-caching=2000")
+            addOption(":no-sub-autodetect-file")
         }
         mediaPlayer.media = media
         media.release()
@@ -277,19 +288,15 @@ fun VlcPlayerScreen(
         }
     }
 
-    // Attach views, event listener, and start initial episode
+    // Register event listener once and release LibVLC cleanly on dispose.
     DisposableEffect(mediaPlayer) {
-        mediaPlayer.attachViews(videoLayout, null, true, false)
-
+        isPlayerDisposed = false
         mediaPlayer.setEventListener { event ->
             mainHandler.post {
+                if (isPlayerDisposed) return@post
                 when (event.type) {
                     MediaPlayer.Event.Opening -> {
                         statusMessage = "Opening stream…"
-                        if (!userToggledSubtitles) {
-                            mediaPlayer.spuTrack = -1
-                            currentSubtitleTrackId = -1
-                        }
                     }
 
                     MediaPlayer.Event.Buffering -> {
@@ -300,7 +307,8 @@ fun VlcPlayerScreen(
                         isPlaying = true
                         isLoading = false
                         errorMessage = null
-                        if (!userToggledSubtitles && mediaPlayer.spuTrack != -1) {
+                        if (!didDisableInitialSubtitles && !userToggledSubtitles) {
+                            didDisableInitialSubtitles = true
                             mediaPlayer.spuTrack = -1
                             currentSubtitleTrackId = -1
                         }
@@ -314,7 +322,8 @@ fun VlcPlayerScreen(
                     }
 
                     MediaPlayer.Event.Vout, MediaPlayer.Event.ESAdded -> {
-                        if (!userToggledSubtitles && mediaPlayer.spuTrack != -1) {
+                        if (!didDisableInitialSubtitles && !userToggledSubtitles && mediaPlayer.spuTrack != -1) {
+                            didDisableInitialSubtitles = true
                             mediaPlayer.spuTrack = -1
                             currentSubtitleTrackId = -1
                         }
@@ -328,7 +337,9 @@ fun VlcPlayerScreen(
                     }
 
                     MediaPlayer.Event.TimeChanged -> {
-                        isLoading = false
+                        if (event.timeChanged > 0L || mediaPlayer.time > 0L) {
+                            isLoading = false
+                        }
                         isPlaying = mediaPlayer.isPlaying
                         if (System.currentTimeMillis() >= seekIgnoreUntilMs) {
                             currentTimeSec = (event.timeChanged.coerceAtLeast(0L)) / 1000.0
@@ -344,7 +355,8 @@ fun VlcPlayerScreen(
                                 seekTo(saved.position)
                             }
                         }
-                        if (!userToggledSubtitles && mediaPlayer.spuTrack != -1) {
+                        if (!didDisableInitialSubtitles && !userToggledSubtitles) {
+                            didDisableInitialSubtitles = true
                             mediaPlayer.spuTrack = -1
                             currentSubtitleTrackId = -1
                         }
@@ -363,15 +375,14 @@ fun VlcPlayerScreen(
                     MediaPlayer.Event.EncounteredError -> {
                         isLoading = false
                         isPlaying = false
-                        errorMessage = "Playback failed. Check connection or try another track."
+                        errorMessage = "Playback failed (${proxy.lastProxyStatus.value})."
                     }
                 }
             }
         }
 
-        startEpisode(initialEpisode)
-
         onDispose {
+            isPlayerDisposed = true
             saveProgress(force = true)
             syncManager.scheduleSyncAfterChange()
             mediaPlayer.setEventListener(null)
@@ -490,18 +501,35 @@ fun VlcPlayerScreen(
             }
     ) {
         AndroidView(
-            factory = { videoLayout },
+            factory = { viewCtx ->
+                VLCVideoLayout(viewCtx).also { layout ->
+                    mediaPlayer.attachViews(layout, null, false, false)
+                    if (!didStartInitialPlayback) {
+                        didStartInitialPlayback = true
+                        layout.post {
+                            if (!isPlayerDisposed) {
+                                startEpisode(initialEpisode)
+                            }
+                        }
+                    }
+                }
+            },
+            update = {},
             modifier = Modifier.fillMaxSize()
         )
 
         if (isLoading && errorMessage == null) {
             Column(
-                modifier = Modifier.align(Alignment.Center),
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .background(Color(0xAA0A0A0F), RoundedCornerShape(14.dp))
+                    .padding(horizontal = 24.dp, vertical = 18.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 CircularProgressIndicator(color = Color(0xFF3B82F6))
-                Text(statusMessage, color = Color.White.copy(alpha = 0.85f), fontSize = 14.sp)
+                Text(statusMessage, color = Color.White.copy(alpha = 0.9f), fontSize = 14.sp)
+                Text(proxyStatus, color = Color(0xFF9CA3AF), fontSize = 12.sp)
             }
         }
 
