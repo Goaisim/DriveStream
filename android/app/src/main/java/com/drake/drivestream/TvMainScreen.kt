@@ -320,6 +320,7 @@ fun TvMainScreen(libraryViewModel: LibraryViewModel = viewModel()) {
     val isAuthenticated by authManager.isAuthenticated.collectAsState()
     val hasAppDataScope by authManager.hasAppDataScope.collectAsState()
     val companionUrl by authManager.companionUrl.collectAsState()
+    val showInAppAuthWebView by authManager.showInAppAuthWebView.collectAsState()
     val savedLinks by linksManager.links.collectAsState()
     val folderId by driveSettings.folderId.collectAsState()
     val coversRevision by syncManager.coversRevision.collectAsState()
@@ -433,6 +434,7 @@ fun TvMainScreen(libraryViewModel: LibraryViewModel = viewModel()) {
                             if (isAuthenticated) libraryViewModel.loadLibrary(folderId)
                         },
                         onSignIn = { authManager.launchTvBrowserSignIn(context) },
+                        onSignInBuiltIn = { authManager.openInAppSignIn() },
                         onOpenSettings = {
                             authManager.refreshLocalIp()
                             showSettingsDialog = true
@@ -556,6 +558,13 @@ fun TvMainScreen(libraryViewModel: LibraryViewModel = viewModel()) {
                 }
             )
         }
+
+        if (showInAppAuthWebView) {
+            InAppOAuthWebViewDialog(
+                authManager = authManager,
+                onDismiss = { authManager.dismissInAppSignIn() }
+            )
+        }
     }
 }
 
@@ -636,20 +645,28 @@ private fun TvSignInScreen(
 
                 Spacer(Modifier.height(6.dp))
 
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     TvActionButton(
-                        label = if (isSigningIn) "Signing In…" else "Sign in on TV Browser",
-                        icon = Icons.Default.PlayArrow,
+                        label = if (isSigningIn) "Signing In…" else "Sign In Using Built-In Browser (Shield / TV)",
+                        icon = Icons.Default.Public,
                         isPrimary = true,
                         modifier = Modifier.focusRequester(primaryFocus),
-                        onClick = { authManager.launchTvBrowserSignIn(context) }
+                        onClick = { authManager.openInAppSignIn() }
                     )
 
-                    TvActionButton(
-                        label = "Use Web Links Only",
-                        icon = Icons.Default.Public,
-                        onClick = onContinueLinksOnly
-                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        TvActionButton(
+                            label = if (isSigningIn) "Signing In…" else "Sign in on TV Browser",
+                            icon = Icons.Default.PlayArrow,
+                            onClick = { authManager.launchTvBrowserSignIn(context) }
+                        )
+
+                        TvActionButton(
+                            label = "Use Web Links Only",
+                            icon = Icons.Default.Tv,
+                            onClick = onContinueLinksOnly
+                        )
+                    }
                 }
             }
 
@@ -721,6 +738,7 @@ private fun TvHomeContent(
     onOpenCoverFinder: (ShowGroup) -> Unit,
     onRefresh: () -> Unit,
     onSignIn: () -> Unit,
+    onSignInBuiltIn: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
     val continueWatching = remember(items, progressMap) {
@@ -926,12 +944,19 @@ private fun TvHomeContent(
                                     fontSize = 14.sp,
                                     textAlign = TextAlign.Center
                                 )
-                                TvActionButton(
-                                    label = "Sign in on TV Browser",
-                                    icon = Icons.Default.PlayArrow,
-                                    isPrimary = true,
-                                    onClick = onSignIn
-                                )
+                                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                    TvActionButton(
+                                        label = "Sign In Using Built-In Browser (Shield / TV)",
+                                        icon = Icons.Default.Public,
+                                        isPrimary = true,
+                                        onClick = onSignInBuiltIn
+                                    )
+                                    TvActionButton(
+                                        label = "Sign in on TV Browser",
+                                        icon = Icons.Default.PlayArrow,
+                                        onClick = onSignIn
+                                    )
+                                }
                             }
                         }
                     }

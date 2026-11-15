@@ -1,8 +1,11 @@
 package com.drake.drivestream
 
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.util.Base64
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -35,6 +38,11 @@ import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.concurrent.TimeUnit
 
+data class AuthSession(
+    val authUrl: String,
+    val codeVerifier: String
+)
+
 class AuthManager private constructor(private val appContext: Context) {
 
     private val prefs = appContext.getSharedPreferences("drivestream_auth", Context.MODE_PRIVATE)
@@ -57,6 +65,9 @@ class AuthManager private constructor(private val appContext: Context) {
 
     private val _hasAppDataScope = MutableStateFlow(storedHasAppDataScope())
     val hasAppDataScope: StateFlow<Boolean> = _hasAppDataScope.asStateFlow()
+
+    private val _showInAppAuthWebView = MutableStateFlow(false)
+    val showInAppAuthWebView: StateFlow<Boolean> = _showInAppAuthWebView.asStateFlow()
 
     private var companionServer: CompanionWebServer? = null
 
@@ -95,13 +106,29 @@ class AuthManager private constructor(private val appContext: Context) {
         _companionUrl.value = "http://${detectLocalIpAddress()}:$COMPANION_PORT"
     }
 
-    fun startNewAuthSession(): String {
+    fun openInAppSignIn() {
+        _authError.value = null
+        _isSigningIn.value = false
+        _showInAppAuthWebView.value = true
+    }
+
+    fun dismissInAppSignIn() {
+        _showInAppAuthWebView.value = false
+    }
+
+    fun reportAuthError(message: String?) {
+        _authError.value = message
+    }
+
+    fun createAuthSession(saveAsPending: Boolean = true): AuthSession {
         val verifier = generateCodeVerifier()
         val challenge = generateCodeChallenge(verifier)
-        prefs.edit().putString(KEY_PENDING_VERIFIER, verifier).apply()
+        if (saveAsPending) {
+            prefs.edit().putString(KEY_PENDING_VERIFIER, verifier).apply()
+        }
         _authError.value = null
 
-        return Uri.parse("https://accounts.google.com/o/oauth2/v2/auth")
+        val url = Uri.parse("https://accounts.google.com/o/oauth2/v2/auth")
             .buildUpon()
             .appendQueryParameter("client_id", CLIENT_ID)
             .appendQueryParameter("redirect_uri", REDIRECT_URI)
@@ -113,9 +140,31 @@ class AuthManager private constructor(private val appContext: Context) {
             .appendQueryParameter("prompt", "consent")
             .build()
             .toString()
+        return AuthSession(authUrl = url, codeVerifier = verifier)
     }
 
+    fun startNewAuthSession(): String = createAuthSession(saveAsPending = true).authUrl
+
     fun launchTvBrowserSignIn(context: Context) {
+        val probeIntent = Intent(Intent.ACTION_VIEW, Uri.parse("https://accounts.google.com")).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        val externalBrowsers = runCatching {
+            context.packageManager.queryIntentActivities(probeIntent, PackageManager.MATCH_DEFAULT_ONLY)
+                .filter { info ->
+                    val pkg = info.activityInfo?.packageName.orEmpty()
+                    pkg.isNotBlank() &&
+                        pkg != context.packageName &&
+                        pkg != "android" &&
+                        !pkg.contains("stubs", ignoreCase = true)
+                }
+        }.getOrDefault(emptyList())
+
+        if (externalBrowsers.isEmpty()) {
+            openInAppSignIn()
+            return
+        }
+
         val authUrl = startNewAuthSession()
         _isSigningIn.value = true
         try {
@@ -123,9 +172,12 @@ class AuthManager private constructor(private val appContext: Context) {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
             context.startActivity(intent)
-        } catch (e: Exception) {
+        } catch (_: ActivityNotFoundException) {
             _isSigningIn.value = false
-            _authError.value = "No browser on TV (${e.localizedMessage}). Use ${_companionUrl.value} on your phone or PC."
+            openInAppSignIn()
+        } catch (_: Exception) {
+            _isSigningIn.value = false
+            openInAppSignIn()
         }
     }
 
@@ -150,10 +202,38 @@ class AuthManager private constructor(private val appContext: Context) {
     suspend fun completeAuthFromInput(rawInput: String): Result<Unit> {
         val trimmed = rawInput.trim()
         if (trimmed.isEmpty()) {
-            return Result.failure(IllegalArgumentException("Paste the redirect URL or authorization code."))
+            val msg = "Please paste a redirect URL, authorization code, or refresh token (1//...) first."
+            _authError.value = msg
+            return Result.failure(IllegalArgumentException(msg))
         }
 
-        if (trimmed.contains("://") || trimmed.contains("code=") || trimmed.contains("error=")) {
+        if (trimmed.startsWith("{")) {
+            val parsed = runCatching { JSONObject(trimmed) }.getOrNull()
+            if (parsed != null) {
+                val refresh = parsed.optString("refresh_token", "").trim()
+                val access = parsed.optString("access_token", "").trim()
+                val exp = parsed.optLong("expiration_ms", 0L)
+                val scopes = parsed.optString("granted_scopes", parsed.optString("scope", "")).trim()
+                if (refresh.isNotBlank()) {
+                    return importTokensFromPeer(refresh, access, exp, scopes)
+                }
+                val jsonCode = parsed.optString("code", "").trim()
+                if (jsonCode.isNotBlank()) {
+                    return exchangeCode(jsonCode)
+                }
+            }
+        }
+
+        val xmlRefresh = Regex("""oauth_refresh_token"[^>]*>([^<]+)<""").find(trimmed)?.groupValues?.getOrNull(1)?.trim()
+        if (!xmlRefresh.isNullOrBlank()) {
+            return signInWithRefreshToken(xmlRefresh)
+        }
+
+        if (trimmed.startsWith("1//")) {
+            return signInWithRefreshToken(trimmed)
+        }
+
+        if (trimmed.contains("://") || trimmed.contains("code=") || trimmed.contains("error=") || trimmed.contains("refresh_token=")) {
             val parsable = if (trimmed.contains("://")) trimmed else "https://dummy.local/?${trimmed.trimStart('?')}"
             val uri = Uri.parse(parsable)
             val err = uri.getQueryParameter("error")
@@ -162,28 +242,43 @@ class AuthManager private constructor(private val appContext: Context) {
                 _authError.value = msg
                 return Result.failure(IllegalStateException(msg))
             }
-            val code = uri.getQueryParameter("code")
-            if (!code.isNullOrBlank()) {
-                return exchangeCode(code)
+            val pastedRefresh = uri.getQueryParameter("refresh_token")?.trim()
+            if (!pastedRefresh.isNullOrBlank()) {
+                return signInWithRefreshToken(pastedRefresh)
             }
+            val code = uri.getQueryParameter("code")?.trim()
+            if (code.isNullOrBlank()) {
+                val msg = "No valid code or refresh_token found in the pasted URL."
+                _authError.value = msg
+                return Result.failure(IllegalArgumentException(msg))
+            }
+            return exchangeCode(code)
         }
 
         return exchangeCode(trimmed)
     }
 
-    private suspend fun exchangeCode(code: String): Result<Unit> = withContext(Dispatchers.IO) {
+    suspend fun exchangeCodeForTokens(code: String, codeVerifier: String): Result<Unit> = withContext(Dispatchers.IO) {
+        val cleanCode = code.trim()
+        if (cleanCode.isEmpty()) {
+            val msg = "Authorization code is empty."
+            _authError.value = msg
+            return@withContext Result.failure(IllegalArgumentException(msg))
+        }
+        val cleanVerifier = codeVerifier.trim()
+        if (cleanVerifier.isEmpty()) {
+            val msg = "No active PKCE session. Click 'Open Google Sign-In' first."
+            _authError.value = msg
+            return@withContext Result.failure(IllegalStateException(msg))
+        }
+
         _isSigningIn.value = true
         _authError.value = null
         try {
-            val verifier = prefs.getString(KEY_PENDING_VERIFIER, null)
-            if (verifier.isNullOrBlank()) {
-                throw IllegalStateException("No active PKCE session. Click 'Open Google Sign-In' first.")
-            }
-
             val form = FormBody.Builder()
                 .add("client_id", CLIENT_ID)
-                .add("code", code.trim())
-                .add("code_verifier", verifier)
+                .add("code", cleanCode)
+                .add("code_verifier", cleanVerifier)
                 .add("grant_type", "authorization_code")
                 .add("redirect_uri", REDIRECT_URI)
                 .build()
@@ -192,6 +287,7 @@ class AuthManager private constructor(private val appContext: Context) {
             saveTokens(tokenJson)
             prefs.edit().remove(KEY_PENDING_VERIFIER).apply()
             _isAuthenticated.value = true
+            _showInAppAuthWebView.value = false
             _authError.value = null
             Result.success(Unit)
         } catch (e: Exception) {
@@ -201,6 +297,156 @@ class AuthManager private constructor(private val appContext: Context) {
         } finally {
             _isSigningIn.value = false
         }
+    }
+
+    suspend fun signInWithRefreshToken(refreshToken: String, fallbackScopes: String? = null): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            val cleanRefresh = refreshToken.trim()
+            if (cleanRefresh.isEmpty()) {
+                val msg = "Refresh token is empty."
+                _authError.value = msg
+                return@withContext Result.failure(IllegalArgumentException(msg))
+            }
+
+            _isSigningIn.value = true
+            _authError.value = null
+            try {
+                val form = FormBody.Builder()
+                    .add("client_id", CLIENT_ID)
+                    .add("refresh_token", cleanRefresh)
+                    .add("grant_type", "refresh_token")
+                    .build()
+
+                val tokenJson = executeTokenRequest(form)
+                saveTokens(
+                    json = tokenJson,
+                    fallbackRefreshToken = cleanRefresh,
+                    fallbackScopes = fallbackScopes
+                )
+                prefs.edit().remove(KEY_PENDING_VERIFIER).apply()
+                _isAuthenticated.value = true
+                _showInAppAuthWebView.value = false
+                _authError.value = null
+                Result.success(Unit)
+            } catch (e: Exception) {
+                val msg = e.message ?: "Refresh token sign-in failed"
+                _authError.value = msg
+                Result.failure(e)
+            } finally {
+                _isSigningIn.value = false
+            }
+        }
+
+    suspend fun importTokensFromPeer(
+        refreshToken: String,
+        accessToken: String = "",
+        expirationMs: Long = 0L,
+        grantedScopes: String = ""
+    ): Result<Unit> {
+        val cleanRefresh = refreshToken.trim()
+        val cleanAccess = accessToken.trim()
+        val cleanScopes = grantedScopes.trim()
+        if (cleanRefresh.isEmpty() && cleanAccess.isEmpty()) {
+            val msg = "Missing refresh_token in payload."
+            _authError.value = msg
+            return Result.failure(IllegalArgumentException(msg))
+        }
+
+        if (cleanAccess.isNotEmpty() &&
+            expirationMs - System.currentTimeMillis() > 60_000L &&
+            cleanScopes.isNotEmpty()
+        ) {
+            persistTokenValues(cleanAccess, cleanRefresh, expirationMs, cleanScopes)
+            prefs.edit().remove(KEY_PENDING_VERIFIER).apply()
+            _isAuthenticated.value = true
+            _showInAppAuthWebView.value = false
+            _authError.value = null
+            return Result.success(Unit)
+        }
+
+        if (cleanRefresh.isEmpty()) {
+            val msg = "Token payload has expired access_token and no refresh_token."
+            _authError.value = msg
+            return Result.failure(IllegalArgumentException(msg))
+        }
+        return signInWithRefreshToken(cleanRefresh, fallbackScopes = cleanScopes.ifBlank { null })
+    }
+
+    fun exportTokensJson(folderId: String): String {
+        val obj = JSONObject().apply {
+            put("authenticated", _isAuthenticated.value)
+            put("client_id", CLIENT_ID)
+            put("device_model", Build.MODEL.orEmpty())
+            put("refresh_token", prefs.getString(KEY_REFRESH_TOKEN, "").orEmpty())
+            put("access_token", prefs.getString(KEY_ACCESS_TOKEN, "").orEmpty())
+            put("expiration_ms", prefs.getLong(KEY_EXPIRATION_MS, 0L))
+            put("granted_scopes", prefs.getString(KEY_GRANTED_SCOPES, "").orEmpty())
+            put("folder_id", folderId)
+        }
+        return obj.toString()
+    }
+
+    suspend fun cloneTokensFromPeer(peerInput: String): Result<String> = withContext(Dispatchers.IO) {
+        val hostPort = normalizePeerHostPort(peerInput)
+            ?: return@withContext Result.failure(
+                IllegalArgumentException("Enter the IP of a signed-in DriveStream TV (e.g. 192.168.0.190).")
+            )
+        try {
+            val req = Request.Builder()
+                .url("http://$hostPort/api/tokens")
+                .get()
+                .build()
+            val jsonText = httpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    throw IOException("Peer $hostPort returned HTTP ${resp.code}")
+                }
+                resp.body?.string().orEmpty()
+            }
+            val obj = JSONObject(jsonText)
+            if (!obj.optBoolean("authenticated", false)) {
+                throw IllegalStateException("Peer TV at $hostPort is not signed in to Google Drive.")
+            }
+            val res = importTokensFromPeer(
+                refreshToken = obj.optString("refresh_token", ""),
+                accessToken = obj.optString("access_token", ""),
+                expirationMs = obj.optLong("expiration_ms", 0L),
+                grantedScopes = obj.optString("granted_scopes", "")
+            )
+            if (res.isFailure) {
+                throw res.exceptionOrNull() ?: IllegalStateException("Token import failed")
+            }
+            Result.success(hostPort)
+        } catch (e: Exception) {
+            val msg = "Could not clone from $hostPort: ${e.message ?: "unreachable"}"
+            _authError.value = msg
+            Result.failure(IllegalStateException(msg, e))
+        }
+    }
+
+    private fun normalizePeerHostPort(raw: String): String? {
+        val trimmed = raw.trim()
+            .removePrefix("http://")
+            .removePrefix("https://")
+            .substringBefore('/')
+            .trim()
+        if (trimmed.isEmpty()) return null
+        return if (trimmed.contains(':')) trimmed else "$trimmed:$COMPANION_PORT"
+    }
+
+    private suspend fun exchangeCode(code: String): Result<Unit> {
+        val cleanCode = code.trim()
+        if (cleanCode.isEmpty()) {
+            val msg = "Authorization code is empty."
+            _authError.value = msg
+            return Result.failure(IllegalArgumentException(msg))
+        }
+        val verifier = prefs.getString(KEY_PENDING_VERIFIER, null).orEmpty()
+        if (verifier.isBlank()) {
+            val msg = "No active PKCE session. Click 'Open Google Sign-In' first."
+            _authError.value = msg
+            return Result.failure(IllegalStateException(msg))
+        }
+        return exchangeCodeForTokens(cleanCode, verifier)
     }
 
     fun getValidAccessToken(): String = runBlocking(Dispatchers.IO) {
@@ -295,12 +541,29 @@ class AuthManager private constructor(private val appContext: Context) {
         }
     }
 
-    private fun saveTokens(json: JSONObject) {
+    private fun saveTokens(
+        json: JSONObject,
+        fallbackRefreshToken: String? = null,
+        fallbackScopes: String? = null
+    ) {
         val accessToken = json.getString("access_token")
         val expiresInSec = json.optLong("expires_in", 3600L)
-        val refreshToken = json.optString("refresh_token", "")
-        val scopeStr = json.optString("scope", "")
+        val refreshToken = json.optString("refresh_token", "").ifBlank { fallbackRefreshToken.orEmpty() }
+        val scopeStr = json.optString("scope", "").ifBlank { fallbackScopes.orEmpty() }
+        persistTokenValues(
+            accessToken = accessToken,
+            refreshToken = refreshToken,
+            expirationMs = System.currentTimeMillis() + expiresInSec * 1000L,
+            scopeStr = scopeStr
+        )
+    }
 
+    private fun persistTokenValues(
+        accessToken: String,
+        refreshToken: String,
+        expirationMs: Long,
+        scopeStr: String
+    ) {
         prefs.edit().apply {
             putString(KEY_ACCESS_TOKEN, accessToken)
             if (refreshToken.isNotBlank()) {
@@ -309,7 +572,7 @@ class AuthManager private constructor(private val appContext: Context) {
             if (scopeStr.isNotBlank()) {
                 putString(KEY_GRANTED_SCOPES, scopeStr)
             }
-            putLong(KEY_EXPIRATION_MS, System.currentTimeMillis() + expiresInSec * 1000L)
+            putLong(KEY_EXPIRATION_MS, expirationMs)
             apply()
         }
         if (scopeStr.isNotBlank()) {
@@ -454,6 +717,41 @@ private class CompanionWebServer(
                     }
                 }
 
+                method == "GET" && path == "/api/tokens" -> {
+                    sendJson(s, 200, authManager.exportTokensJson(driveSettings.folderId.value))
+                }
+
+                method == "POST" && path == "/api/tokens" -> {
+                    val result = runCatching {
+                        if (body.isBlank()) throw IllegalArgumentException("Empty JSON body")
+                        val obj = JSONObject(body)
+                        val res = runBlocking {
+                            authManager.importTokensFromPeer(
+                                refreshToken = obj.optString("refresh_token", ""),
+                                accessToken = obj.optString("access_token", ""),
+                                expirationMs = obj.optLong("expiration_ms", 0L),
+                                grantedScopes = obj.optString("granted_scopes", obj.optString("scope", ""))
+                            )
+                        }
+                        if (res.isFailure) {
+                            throw res.exceptionOrNull() ?: IllegalStateException("Token import failed")
+                        }
+                        syncManager.triggerManualSync()
+                        JSONObject()
+                            .put("status", "ok")
+                            .put("authenticated", authManager.isAuthenticated.value)
+                            .toString()
+                    }
+                    if (result.isSuccess) {
+                        sendJson(s, 200, result.getOrThrow())
+                    } else {
+                        val errJson = JSONObject()
+                            .put("error", result.exceptionOrNull()?.message ?: "Invalid token payload")
+                            .toString()
+                        sendJson(s, 400, errJson)
+                    }
+                }
+
                 method == "GET" && path == "/oauth/start" -> {
                     val authUrl = authManager.startNewAuthSession()
                     sendRedirect(s, 302, authUrl)
@@ -461,13 +759,42 @@ private class CompanionWebServer(
 
                 method == "POST" && path == "/oauth/complete" -> {
                     val params = parseForm(body)
-                    val codeInput = params["code"].orEmpty()
+                    val codeInput = params["code"]?.trim().orEmpty()
+                    if (codeInput.isEmpty()) {
+                        sendRedirect(
+                            s,
+                            303,
+                            "/?err=${urlEnc("Paste a redirect URL, authorization code, or refresh token (1//...) before submitting.")}"
+                        )
+                        return
+                    }
                     val result = runBlocking { authManager.completeAuthFromInput(codeInput) }
                     if (result.isSuccess) {
                         syncManager.triggerManualSync()
                         sendRedirect(s, 303, "/?msg=${urlEnc("Signed in to Google Drive on TV!")}")
                     } else {
                         val err = result.exceptionOrNull()?.message ?: "Sign-in failed"
+                        sendRedirect(s, 303, "/?err=${urlEnc(err)}")
+                    }
+                }
+
+                method == "POST" && path == "/oauth/clone" -> {
+                    val params = parseForm(body)
+                    val peer = params["peer"]?.trim().orEmpty()
+                    if (peer.isEmpty()) {
+                        sendRedirect(
+                            s,
+                            303,
+                            "/?err=${urlEnc("Enter the IP of a signed-in DriveStream TV first (e.g. 192.168.0.190).")}"
+                        )
+                        return
+                    }
+                    val result = runBlocking { authManager.cloneTokensFromPeer(peer) }
+                    if (result.isSuccess) {
+                        syncManager.triggerManualSync()
+                        sendRedirect(s, 303, "/?msg=${urlEnc("Cloned Google Drive session from ${result.getOrThrow()}!")}")
+                    } else {
+                        val err = result.exceptionOrNull()?.message ?: "Peer token clone failed"
                         sendRedirect(s, 303, "/?err=${urlEnc(err)}")
                     }
                 }
@@ -617,20 +944,34 @@ private class CompanionWebServer(
             }
         }
 
+        val bookmarkletJs =
+            "javascript:(function(){var u=location.href,c='';try{c=new URL(u).searchParams.get('code')||'';}catch(e){}if(!c&&window.performance&&performance.getEntries){var es=performance.getEntries();for(var i=0;i<es.length;i++){if(es[i].name&&es[i].name.indexOf('code=')>=0){try{c=new URL(es[i].name).searchParams.get('code')||'';if(c)break;}catch(e){}}}}var raw=c||prompt('Desktop Chrome blocked the custom oauthredirect scheme.\\nOpen DevTools (F12) -> Console (or Network with Preserve log), copy the oauthredirect?code=... URL or code= value, and paste here:');if(raw){var code=raw.trim();try{if(code.indexOf('code=')>=0){var q=code.indexOf('?')>=0?code.split('?')[1]:code;code=new URLSearchParams(q).get('code')||code;}}catch(e){}prompt('Copy this extracted code & paste on the DriveStream Companion page:',code);}})();"
+
+        val cloneSectionHtml = """
+            <div class="subcard">
+                <p class="hint" style="margin:0 0 8px"><strong>Option 3 &mdash; Clone Login from Another DriveStream TV on LAN</strong> (calls <code>GET /api/tokens</code>):</p>
+                <form method="post" action="/oauth/clone" novalidate onsubmit="return validateFormInput(this, 'peer', 'Enter the IP of a signed-in DriveStream TV (e.g. 192.168.0.190) first.');">
+                    <input name="peer" placeholder="Peer TV IP (e.g. 192.168.0.190)" />
+                    <button type="submit" class="btn">Clone Login from Peer TV</button>
+                </form>
+            </div>
+        """.trimIndent()
+
         val authSection = if (isAuthed) {
             val cloudHint = if (hasAppData) {
                 """<p class="status ok">Google Drive Cloud Sync: Enabled</p>"""
             } else {
                 """<p class="hint">Cloud Sync (appDataFolder) not granted yet. Click below to re-authorize with Cloud Sync.</p>
                 <a class="btn primary" href="/oauth/start" target="_blank" rel="noopener">Enable Cloud Sync</a>
-                <form method="post" action="/oauth/complete" style="margin-top:10px;margin-bottom:10px">
-                    <input name="code" placeholder="Paste redirect URL or authorization code..." required />
+                <form method="post" action="/oauth/complete" novalidate onsubmit="return validateFormInput(this, 'code', 'Paste the redirect URL, authorization code, or refresh token (1//...) first.');" style="margin-top:10px;margin-bottom:10px">
+                    <input name="code" placeholder="Paste redirect URL, code=..., or refresh token (1//...)" />
                     <button type="submit" class="btn primary">Complete Cloud Sync Auth</button>
                 </form>"""
             }
             """
             <p class="status ok">Google Drive: Signed In</p>
             $cloudHint
+            <p class="hint">LAN token sync endpoints for other TVs: <code>GET /api/tokens</code> &bull; <code>POST /api/tokens</code></p>
             <form method="post" action="/oauth/signout">
                 <button type="submit" class="btn danger">Sign Out</button>
             </form>
@@ -638,13 +979,21 @@ private class CompanionWebServer(
         } else {
             """
             <p class="status">Google Drive: Not Signed In</p>
-            <p class="hint">1. Click below to authorize DriveStream with Google (opens in new tab).<br>
-            2. Copy the redirect URL (<code>com.googleusercontent.apps...:/oauthredirect?code=...</code>) or <code>code</code> value from your browser address bar and paste it below.</p>
+            <p class="hint"><strong>Recommended on Shield / Android TV:</strong> Use the <em>Sign In Using Built-In Browser (Shield / TV)</em> button right on the TV screen &mdash; it captures the OAuth redirect automatically.<br><br>
+            <strong>Option 1 &mdash; Desktop Browser OAuth (Chrome / Edge hide custom URLs):</strong><br>
+            1. Click <strong>Open Google Sign-In</strong> below (opens a new tab).<br>
+            2. Before clicking <em>Continue</em> on Google, press <strong>F12 &rarr; Network</strong> and check <strong>Preserve log</strong> (or open <strong>F12 &rarr; Console</strong>).<br>
+            3. After clicking <em>Continue</em> (even if the tab jumps to <code>www.google.com</code>), look in Console for <code>Failed to launch 'com.googleusercontent.apps...:/oauthredirect?code=...'</code> or in Network for <code>oauthredirect?code=...</code>, copy the URL or <code>code=</code> value, and paste below.<br>
+            4. Helper bookmarklet (drag to bookmarks bar): <a class="btn" style="padding:4px 10px;font-size:12px" href="${esc(bookmarkletJs)}">Get DriveStream Code</a></p>
             <a class="btn primary" href="/oauth/start" target="_blank" rel="noopener">Open Google Sign-In</a>
-            <form method="post" action="/oauth/complete" style="margin-top:12px">
-                <input name="code" placeholder="Paste redirect URL or authorization code..." required />
-                <button type="submit" class="btn primary">Complete Sign-In</button>
-            </form>
+            <div class="subcard">
+                <p class="hint" style="margin:0 0 8px"><strong>Option 2 &mdash; Paste Redirect URL, Code, JSON, or Refresh Token (<code>1//...</code>):</strong></p>
+                <form method="post" action="/oauth/complete" novalidate onsubmit="return validateFormInput(this, 'code', 'Please paste a redirect URL, authorization code, or refresh token (1//...) before clicking Complete Sign-In.');">
+                    <input name="code" placeholder="Paste redirect URL, code=..., or refresh_token (1//...)" />
+                    <button type="submit" class="btn primary">Complete Sign-In</button>
+                </form>
+            </div>
+            $cloneSectionHtml
             """
         }
 
@@ -680,6 +1029,7 @@ private class CompanionWebServer(
                 h1{font-size:24px;margin:0 0 16px}
                 h2{font-size:16px;margin:0 0 10px;color:#93c5fd}
                 .card{background:#151622;border:1px solid #26293d;border-radius:14px;padding:16px;margin-bottom:16px}
+                .subcard{margin-top:14px;padding-top:12px;border-top:1px solid #242638}
                 input{width:100%;box-sizing:border-box;padding:10px 12px;border-radius:10px;border:1px solid #2d3148;background:#0d0e16;color:#fff;margin-bottom:8px;font-size:15px}
                 .btn{display:inline-block;padding:10px 16px;border-radius:10px;border:0;background:#26293d;color:#fff;font-weight:600;font-size:14px;text-decoration:none;cursor:pointer}
                 .btn.primary{background:#2563eb}
@@ -693,16 +1043,36 @@ private class CompanionWebServer(
                 .status.ok{color:#4ade80;font-weight:600}
                 code{background:#0d0e16;padding:2px 6px;border-radius:6px;word-break:break-all}
             </style>
+            <script>
+                function validateFormInput(form, fieldName, message) {
+                    var el = form.querySelector('[name="' + fieldName + '"]');
+                    var errBox = document.getElementById('clientErrBanner');
+                    if (!el || !el.value || !el.value.trim()) {
+                        if (errBox) {
+                            errBox.textContent = message;
+                            errBox.style.display = 'block';
+                        } else {
+                            alert(message);
+                        }
+                        if (el) el.focus();
+                        return false;
+                    }
+                    el.value = el.value.trim();
+                    if (errBox) errBox.style.display = 'none';
+                    return true;
+                }
+            </script>
         </head>
         <body>
-            <h1>DriveStream Fire TV Companion</h1>
+            <h1>DriveStream TV Companion</h1>
             $bannerHtml
+            <div id="clientErrBanner" class="banner err" style="display:none"></div>
             <div class="card">
-                <h2>Google Account (OAuth PKCE)</h2>
+                <h2>Google Account (OAuth PKCE / Token Sync)</h2>
                 $authSection
             </div>
             <div class="card">
-                <h2>Add Web Link to Fire TV</h2>
+                <h2>Add Web Link to TV</h2>
                 <form method="post" action="/links/add">
                     <input name="title" placeholder="Title (optional)" />
                     <input name="url" placeholder="https://example.com" required />

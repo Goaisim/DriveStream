@@ -12,6 +12,7 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.inputmethod.InputMethodManager
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.JsResult
@@ -55,6 +56,7 @@ import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Shield
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Text
@@ -67,6 +69,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -90,6 +93,7 @@ import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -765,13 +769,7 @@ fun AdBlockWebViewScreen(
 
     fun dispatchVirtualTapAtCursor() {
         clickPulseActive = true
-        val downTime = SystemClock.uptimeMillis()
-        val down = MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, cursorX, cursorY, 0)
-        val up = MotionEvent.obtain(downTime, downTime + 35L, MotionEvent.ACTION_UP, cursorX, cursorY, 0)
-        webView.dispatchTouchEvent(down)
-        webView.dispatchTouchEvent(up)
-        down.recycle()
-        up.recycle()
+        dispatchWebViewTap(webView, cursorX, cursorY)
         mainHandler.postDelayed({ clickPulseActive = false }, 180L)
     }
 
@@ -1128,45 +1126,19 @@ fun AdBlockWebViewScreen(
                     .onPreviewKeyEvent { keyEvent ->
                         if (customVideoView != null || nativeStreamSpec != null) return@onPreviewKeyEvent false
                         if (keyEvent.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
-
-                        val native = keyEvent.nativeKeyEvent
-                        val step = if (native.repeatCount >= 4) 52f else if (native.repeatCount >= 1) 34f else 22f
-                        val edgeMargin = webHeightPx * 0.12f
-
-                        when (native.keyCode) {
-                            KeyEvent.KEYCODE_DPAD_UP -> {
-                                cursorY = (cursorY - step).coerceAtLeast(0f)
-                                if (cursorY <= edgeMargin) {
-                                    webView.scrollBy(0, -140)
-                                }
-                                true
-                            }
-
-                            KeyEvent.KEYCODE_DPAD_DOWN -> {
-                                cursorY = (cursorY + step).coerceAtMost(webHeightPx)
-                                if (cursorY >= webHeightPx - edgeMargin) {
-                                    webView.scrollBy(0, 140)
-                                }
-                                true
-                            }
-
-                            KeyEvent.KEYCODE_DPAD_LEFT -> {
-                                cursorX = (cursorX - step).coerceAtLeast(0f)
-                                true
-                            }
-
-                            KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                                cursorX = (cursorX + step).coerceAtMost(webWidthPx)
-                                true
-                            }
-
-                            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
-                                dispatchVirtualTapAtCursor()
-                                true
-                            }
-
-                            else -> false
-                        }
+                        handleCursorDpadKey(
+                            native = keyEvent.nativeKeyEvent,
+                            webView = webView,
+                            cursorX = cursorX,
+                            cursorY = cursorY,
+                            webWidthPx = webWidthPx,
+                            webHeightPx = webHeightPx,
+                            onCursorMove = { nx, ny ->
+                                cursorX = nx
+                                cursorY = ny
+                            },
+                            onTap = { dispatchVirtualTapAtCursor() }
+                        )
                     }
             ) {
                 AndroidView(
@@ -1174,37 +1146,12 @@ fun AdBlockWebViewScreen(
                     modifier = Modifier.fillMaxSize()
                 )
 
-                // On-screen pointer cursor overlay
-                Canvas(modifier = Modifier.fillMaxSize()) {
-                    val x = cursorX.coerceIn(0f, size.width)
-                    val y = cursorY.coerceIn(0f, size.height)
-
-                    if (clickPulseActive) {
-                        drawCircle(
-                            color = Color(0xFF60A5FA).copy(alpha = 0.55f),
-                            radius = 24f,
-                            center = Offset(x, y),
-                            style = Stroke(width = 4f)
-                        )
-                    }
-
-                    val pointer = Path().apply {
-                        moveTo(x, y)
-                        lineTo(x, y + 32f)
-                        lineTo(x + 9f, y + 24f)
-                        lineTo(x + 17f, y + 38f)
-                        lineTo(x + 22f, y + 35f)
-                        lineTo(x + 14f, y + 21f)
-                        lineTo(x + 25f, y + 21f)
-                        close()
-                    }
-                    drawPath(path = pointer, color = Color.White)
-                    drawPath(
-                        path = pointer,
-                        color = Color(0xFF0A0A0F),
-                        style = Stroke(width = 3f)
-                    )
-                }
+                VirtualPointerOverlay(
+                    cursorX = cursorX,
+                    cursorY = cursorY,
+                    clickPulseActive = clickPulseActive,
+                    modifier = Modifier.fillMaxSize()
+                )
             }
         }
 
@@ -1277,6 +1224,509 @@ private fun BrowserIconButton(
 }
 
 private fun Color.opacity(alpha: Float): Color = this.copy(alpha = alpha)
+
+internal const val MOBILE_CHROME_OAUTH_UA =
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+
+internal fun dispatchWebViewTap(webView: WebView, x: Float, y: Float) {
+    val downTime = SystemClock.uptimeMillis()
+    val down = MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, x, y, 0)
+    val up = MotionEvent.obtain(downTime, downTime + 35L, MotionEvent.ACTION_UP, x, y, 0)
+    webView.dispatchTouchEvent(down)
+    webView.dispatchTouchEvent(up)
+    down.recycle()
+    up.recycle()
+}
+
+internal fun handleCursorDpadKey(
+    native: KeyEvent,
+    webView: WebView,
+    cursorX: Float,
+    cursorY: Float,
+    webWidthPx: Float,
+    webHeightPx: Float,
+    allowTopEscape: Boolean = false,
+    onCursorMove: (Float, Float) -> Unit,
+    onTap: () -> Unit
+): Boolean {
+    val step = if (native.repeatCount >= 4) 52f else if (native.repeatCount >= 1) 34f else 22f
+    val edgeMargin = webHeightPx * 0.12f
+
+    return when (native.keyCode) {
+        KeyEvent.KEYCODE_DPAD_UP -> {
+            if (allowTopEscape && cursorY <= 1f && webView.scrollY <= 0) {
+                return false
+            }
+            val nextY = (cursorY - step).coerceAtLeast(0f)
+            onCursorMove(cursorX, nextY)
+            if (nextY <= edgeMargin) {
+                webView.scrollBy(0, -140)
+            }
+            true
+        }
+
+        KeyEvent.KEYCODE_DPAD_DOWN -> {
+            val nextY = (cursorY + step).coerceAtMost(webHeightPx)
+            onCursorMove(cursorX, nextY)
+            if (nextY >= webHeightPx - edgeMargin) {
+                webView.scrollBy(0, 140)
+            }
+            true
+        }
+
+        KeyEvent.KEYCODE_DPAD_LEFT -> {
+            onCursorMove((cursorX - step).coerceAtLeast(0f), cursorY)
+            true
+        }
+
+        KeyEvent.KEYCODE_DPAD_RIGHT -> {
+            onCursorMove((cursorX + step).coerceAtMost(webWidthPx), cursorY)
+            true
+        }
+
+        KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
+            onTap()
+            true
+        }
+
+        else -> false
+    }
+}
+
+@Composable
+internal fun VirtualPointerOverlay(
+    cursorX: Float,
+    cursorY: Float,
+    clickPulseActive: Boolean,
+    modifier: Modifier = Modifier
+) {
+    Canvas(modifier = modifier) {
+        val x = cursorX.coerceIn(0f, size.width)
+        val y = cursorY.coerceIn(0f, size.height)
+
+        if (clickPulseActive) {
+            drawCircle(
+                color = Color(0xFF60A5FA).copy(alpha = 0.55f),
+                radius = 24f,
+                center = Offset(x, y),
+                style = Stroke(width = 4f)
+            )
+        }
+
+        val pointer = Path().apply {
+            moveTo(x, y)
+            lineTo(x, y + 32f)
+            lineTo(x + 9f, y + 24f)
+            lineTo(x + 17f, y + 38f)
+            lineTo(x + 22f, y + 35f)
+            lineTo(x + 14f, y + 21f)
+            lineTo(x + 25f, y + 21f)
+            close()
+        }
+        drawPath(path = pointer, color = Color.White)
+        drawPath(
+            path = pointer,
+            color = Color(0xFF0A0A0F),
+            style = Stroke(width = 3f)
+        )
+    }
+}
+
+@SuppressLint("SetJavaScriptEnabled")
+@Composable
+internal fun InAppOAuthWebViewDialog(
+    authManager: AuthManager,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val mainHandler = remember { Handler(Looper.getMainLooper()) }
+    val authSession = remember { authManager.createAuthSession(saveAsPending = true) }
+
+    var currentUrl by remember { mutableStateOf(authSession.authUrl) }
+    var isLoading by remember { mutableStateOf(true) }
+    var isExchangingCode by remember { mutableStateOf(false) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    var handledRedirect by remember { mutableStateOf(false) }
+
+    // pointerMode = true -> D-Pad moves virtual mouse pointer; false -> typing/WebView focus
+    var pointerMode by remember { mutableStateOf(true) }
+    var webWidthPx by remember { mutableFloatStateOf(1920f) }
+    var webHeightPx by remember { mutableFloatStateOf(960f) }
+    var cursorX by remember { mutableFloatStateOf(960f) }
+    var cursorY by remember { mutableFloatStateOf(480f) }
+    var cursorInitialized by remember { mutableStateOf(false) }
+    var clickPulseActive by remember { mutableStateOf(false) }
+    val cursorFocusRequester = remember { FocusRequester() }
+
+    lateinit var webViewRef: WebView
+
+    fun maybeHandleOAuthRedirect(uri: Uri?): Boolean {
+        if (uri == null) return false
+        val raw = uri.toString()
+        val matchesRedirect = raw.startsWith(AuthManager.REDIRECT_URI) ||
+            uri.scheme.equals(AuthManager.REDIRECT_SCHEME, ignoreCase = true)
+        if (!matchesRedirect) return false
+        if (handledRedirect) return true
+        handledRedirect = true
+
+        val err = uri.getQueryParameter("error")
+        if (!err.isNullOrBlank()) {
+            val msg = "Google Sign-In error: $err"
+            errorMessage = msg
+            authManager.reportAuthError(msg)
+            return true
+        }
+
+        val code = uri.getQueryParameter("code")
+        if (code.isNullOrBlank()) {
+            val msg = "Authorization code missing from redirect URL."
+            errorMessage = msg
+            authManager.reportAuthError(msg)
+            return true
+        }
+
+        isExchangingCode = true
+        errorMessage = null
+        scope.launch {
+            val result = authManager.exchangeCodeForTokens(code, authSession.codeVerifier)
+            isExchangingCode = false
+            if (result.isSuccess) {
+                SyncManager.getInstance(context).triggerManualSync()
+                onDismiss()
+            } else {
+                handledRedirect = false
+                errorMessage = result.exceptionOrNull()?.message ?: "Sign-in token exchange failed."
+            }
+        }
+        return true
+    }
+
+    val webView = remember(context) {
+        WebView(context).apply {
+            setBackgroundColor(AndroidColor.WHITE)
+            setLayerType(View.LAYER_TYPE_HARDWARE, null)
+            keepScreenOn = true
+            isFocusable = true
+            isFocusableInTouchMode = true
+            settings.apply {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                databaseEnabled = true
+                useWideViewPort = true
+                loadWithOverviewMode = true
+                javaScriptCanOpenWindowsAutomatically = true
+                setSupportMultipleWindows(false)
+                userAgentString = MOBILE_CHROME_OAUTH_UA
+            }
+
+            CookieManager.getInstance().setAcceptCookie(true)
+            CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+
+            webViewClient = object : WebViewClient() {
+                override fun shouldOverrideUrlLoading(
+                    view: WebView?,
+                    request: WebResourceRequest?
+                ): Boolean {
+                    val uri = request?.url ?: return false
+                    if (maybeHandleOAuthRedirect(uri)) {
+                        view?.stopLoading()
+                        return true
+                    }
+                    return false
+                }
+
+                override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                    super.onPageStarted(view, url, favicon)
+                    if (!url.isNullOrBlank()) {
+                        val parsed = runCatching { Uri.parse(url) }.getOrNull()
+                        if (maybeHandleOAuthRedirect(parsed)) {
+                            view?.stopLoading()
+                            return
+                        }
+                        currentUrl = url
+                    }
+                    isLoading = true
+                }
+
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    super.onPageFinished(view, url)
+                    isLoading = false
+                    if (!url.isNullOrBlank()) {
+                        currentUrl = url
+                    }
+                }
+            }
+
+            webChromeClient = object : WebChromeClient() {
+                override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                    if (newProgress >= 100) isLoading = false
+                }
+            }
+
+            loadUrl(authSession.authUrl)
+        }
+    }
+    webViewRef = webView
+
+    fun tapAndAutoFocusInput() {
+        clickPulseActive = true
+        dispatchWebViewTap(webViewRef, cursorX, cursorY)
+        mainHandler.postDelayed({ clickPulseActive = false }, 180L)
+        mainHandler.postDelayed({
+            webViewRef.evaluateJavascript(
+                "(function(){var a=document.activeElement;if(!a)return false;var t=(a.tagName||'').toUpperCase();if(t==='TEXTAREA')return true;if(t==='INPUT'){var tp=(a.type||'text').toLowerCase();return ['hidden','checkbox','radio','submit','button','reset','image'].indexOf(tp)===-1;}return !!a.isContentEditable;})()"
+            ) { raw ->
+                if (raw == "true") {
+                    pointerMode = false
+                    webViewRef.requestFocus()
+                    val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+                    imm?.showSoftInput(webViewRef, InputMethodManager.SHOW_IMPLICIT)
+                }
+            }
+        }, 120L)
+    }
+
+    LaunchedEffect(Unit) {
+        delay(60L)
+        runCatching { cursorFocusRequester.requestFocus() }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            webViewRef.stopLoading()
+            webViewRef.loadUrl("about:blank")
+            webViewRef.destroy()
+        }
+    }
+
+    BackHandler {
+        if (!pointerMode) {
+            val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+            imm?.hideSoftInputFromWindow(webViewRef.windowToken, 0)
+            pointerMode = true
+            runCatching { cursorFocusRequester.requestFocus() }
+        } else if (webViewRef.canGoBack()) {
+            webViewRef.goBack()
+        } else {
+            onDismiss()
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF0A0A0F))
+    ) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            // Top Controls Bar
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF141621))
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                BrowserIconButton(
+                    icon = Icons.AutoMirrored.Filled.ArrowBack,
+                    contentDescription = "Back",
+                    enabled = webViewRef.canGoBack(),
+                    onClick = { webViewRef.goBack() }
+                )
+
+                BrowserIconButton(
+                    icon = Icons.Default.Refresh,
+                    contentDescription = "Reload",
+                    onClick = { webViewRef.reload() }
+                )
+
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Google Sign-In (Built-In Shield / TV Browser)",
+                        color = Color.White,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = if (pointerMode) {
+                            "D-Pad moves cursor • OK clicks & opens keyboard • Up at top opens bar"
+                        } else {
+                            "Keyboard / Direct Mode • Press Back when finished typing to return to cursor"
+                        },
+                        color = Color(0xFF93C5FD),
+                        fontSize = 11.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+
+                var modeFocused by remember { mutableStateOf(false) }
+                Row(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(
+                            if (modeFocused) Color(0xFF3B82F6)
+                            else if (pointerMode) Color(0xFF1D4ED8)
+                            else Color(0xFF15803D)
+                        )
+                        .border(
+                            width = if (modeFocused) 2.dp else 1.dp,
+                            color = if (modeFocused) Color.White else Color.White.copy(alpha = 0.25f),
+                            shape = RoundedCornerShape(10.dp)
+                        )
+                        .onFocusChanged { modeFocused = it.isFocused }
+                        .focusable()
+                        .clickable {
+                            val nextPointer = !pointerMode
+                            pointerMode = nextPointer
+                            if (nextPointer) {
+                                val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+                                imm?.hideSoftInputFromWindow(webViewRef.windowToken, 0)
+                                runCatching { cursorFocusRequester.requestFocus() }
+                            } else {
+                                webViewRef.requestFocus()
+                            }
+                        }
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = if (pointerMode) "Mode: Cursor" else "Mode: Keyboard",
+                        color = Color.White,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+
+                BrowserIconButton(
+                    icon = Icons.Default.Close,
+                    contentDescription = "Cancel Sign-In",
+                    onClick = onDismiss
+                )
+            }
+
+            if (isLoading && !isExchangingCode) {
+                LinearProgressIndicator(
+                    modifier = Modifier.fillMaxWidth().height(3.dp),
+                    color = Color(0xFF3B82F6),
+                    trackColor = Color(0xFF1E293B)
+                )
+            }
+
+            if (!errorMessage.isNullOrBlank()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color(0xFF7F1D1D))
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = errorMessage.orEmpty(),
+                        color = Color(0xFFFECACA),
+                        fontSize = 13.sp,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Text(
+                        text = currentUrl.take(48),
+                        color = Color.White.copy(alpha = 0.6f),
+                        fontSize = 11.sp
+                    )
+                }
+            }
+
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .onSizeChanged { size ->
+                        if (size.width > 0 && size.height > 0) {
+                            webWidthPx = size.width.toFloat()
+                            webHeightPx = size.height.toFloat()
+                            if (!cursorInitialized) {
+                                cursorX = webWidthPx / 2f
+                                cursorY = webHeightPx / 2f
+                                cursorInitialized = true
+                            } else {
+                                cursorX = cursorX.coerceIn(0f, webWidthPx)
+                                cursorY = cursorY.coerceIn(0f, webHeightPx)
+                            }
+                        }
+                    }
+                    .focusRequester(cursorFocusRequester)
+                    .focusable(enabled = pointerMode)
+                    .onPreviewKeyEvent { keyEvent ->
+                        if (keyEvent.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                        val native = keyEvent.nativeKeyEvent
+                        if (native.keyCode == KeyEvent.KEYCODE_MENU) {
+                            pointerMode = !pointerMode
+                            if (pointerMode) {
+                                runCatching { cursorFocusRequester.requestFocus() }
+                            } else {
+                                webViewRef.requestFocus()
+                            }
+                            return@onPreviewKeyEvent true
+                        }
+                        if (!pointerMode) return@onPreviewKeyEvent false
+                        handleCursorDpadKey(
+                            native = native,
+                            webView = webViewRef,
+                            cursorX = cursorX,
+                            cursorY = cursorY,
+                            webWidthPx = webWidthPx,
+                            webHeightPx = webHeightPx,
+                            allowTopEscape = true,
+                            onCursorMove = { nx, ny ->
+                                cursorX = nx
+                                cursorY = ny
+                            },
+                            onTap = { tapAndAutoFocusInput() }
+                        )
+                    }
+            ) {
+                AndroidView(
+                    factory = { webView },
+                    modifier = Modifier.fillMaxSize()
+                )
+
+                if (pointerMode && !isExchangingCode) {
+                    VirtualPointerOverlay(
+                        cursorX = cursorX,
+                        cursorY = cursorY,
+                        clickPulseActive = clickPulseActive,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
+
+                if (isExchangingCode) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(Color.Black.copy(alpha = 0.72f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            CircularProgressIndicator(color = Color(0xFF3B82F6))
+                            Text(
+                                text = "Completing Google Drive Sign-In…",
+                                color = Color.White,
+                                fontSize = 18.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 private fun resolveAddressOrSearchUrl(raw: String): String? {
     val trimmed = raw.trim()
