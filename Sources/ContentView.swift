@@ -249,13 +249,20 @@ final class LibraryViewModel: ObservableObject {
 
 struct ContentView: View {
     @EnvironmentObject private var authManager: AuthManager
+    @ObservedObject private var linksManager = SavedLinksManager.shared
+    @State private var bypassSignIn = false
 
     var body: some View {
         Group {
-            if authManager.isAuthenticated {
+            if authManager.isAuthenticated || bypassSignIn || !linksManager.links.isEmpty {
                 LibraryHomeView()
             } else {
-                SignInView()
+                SignInView(onContinueLinksOnly: { bypassSignIn = true })
+            }
+        }
+        .onChange(of: authManager.isAuthenticated) { _, authenticated in
+            if authenticated {
+                bypassSignIn = false
             }
         }
         .animation(.easeInOut(duration: 0.25), value: authManager.isAuthenticated)
@@ -266,6 +273,7 @@ struct ContentView: View {
 
 private struct SignInView: View {
     @EnvironmentObject private var authManager: AuthManager
+    let onContinueLinksOnly: () -> Void
 
     var body: some View {
         ZStack {
@@ -310,27 +318,39 @@ private struct SignInView: View {
 
                 Spacer()
 
-                Button {
-                    Task { await authManager.signIn() }
-                } label: {
-                    HStack(spacing: 10) {
-                        if authManager.isSigningIn {
-                            ProgressView()
-                                .tint(.black)
-                        } else {
-                            Image(systemName: "person.crop.circle.badge.checkmark")
-                                .font(.headline)
+                VStack(spacing: 12) {
+                    Button {
+                        Task { await authManager.signIn() }
+                    } label: {
+                        HStack(spacing: 10) {
+                            if authManager.isSigningIn {
+                                ProgressView()
+                                    .tint(.black)
+                            } else {
+                                Image(systemName: "person.crop.circle.badge.checkmark")
+                                    .font(.headline)
+                            }
+                            Text(authManager.isSigningIn ? "Signing In…" : "Sign in with Google")
+                                .fontWeight(.semibold)
                         }
-                        Text(authManager.isSigningIn ? "Signing In…" : "Sign in with Google")
-                            .fontWeight(.semibold)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 16)
+                        .background(Color.white)
+                        .foregroundStyle(.black)
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                     }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 16)
-                    .background(Color.white)
-                    .foregroundStyle(.black)
-                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .disabled(authManager.isSigningIn)
+
+                    Button(action: onContinueLinksOnly) {
+                        Text("Use Web Links Only")
+                            .font(.subheadline.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 14)
+                            .background(Color.white.opacity(0.1))
+                            .foregroundStyle(.white)
+                            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    }
                 }
-                .disabled(authManager.isSigningIn)
                 .padding(.horizontal, 28)
                 .padding(.bottom, 36)
             }
@@ -423,23 +443,6 @@ private struct LibraryHomeView: View {
                 .refreshable {
                     await reload()
                 }
-                .overlay {
-                    if viewModel.isLoading && viewModel.items.isEmpty && linksManager.links.isEmpty {
-                        VStack(spacing: 12) {
-                            ProgressView()
-                                .scaleEffect(1.2)
-                            Text("Scanning Google Drive…")
-                                .font(.subheadline)
-                                .foregroundStyle(.secondary)
-                        }
-                    } else if !viewModel.isLoading && viewModel.items.isEmpty && viewModel.errorMessage == nil && linksManager.links.isEmpty {
-                        ContentUnavailableView(
-                            "No Videos Found",
-                            systemImage: "film.stack",
-                            description: Text(folderID.isEmpty ? "No video files were found in your Google Drive." : "No videos found in the configured Folder ID. Check Settings or pull to refresh.")
-                        )
-                    }
-                }
                 .sheet(item: $linkEditorMode, onDismiss: {
                     if let pending = pendingWebLinkToOpen {
                         pendingWebLinkToOpen = nil
@@ -498,8 +501,18 @@ private struct LibraryHomeView: View {
                 AdBlockEngine.shared.prepare()
                 guard !hasLoadedOnce else { return }
                 hasLoadedOnce = true
-                Task { await SyncManager.shared.syncOnLaunch() }
-                await reload()
+                if authManager.isAuthenticated {
+                    Task { await SyncManager.shared.syncOnLaunch() }
+                    await reload()
+                }
+            }
+            .onChange(of: authManager.isAuthenticated) { _, authenticated in
+                if authenticated {
+                    Task {
+                        await SyncManager.shared.syncOnLaunch()
+                        await reload()
+                    }
+                }
             }
             .onChange(of: syncManager.coversRevision) { _, _ in
                 Task {
@@ -605,65 +618,149 @@ private struct LibraryHomeView: View {
 
     private var librarySection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            if !viewModel.showGroups.isEmpty {
-                Text("Library")
+            HStack {
+                Text("Google Drive Library")
                     .font(.title3.bold())
-                    .padding(.horizontal, 16)
+                Spacer()
+                if viewModel.isLoading && !viewModel.showGroups.isEmpty {
+                    ProgressView()
+                        .controlSize(.small)
+                }
             }
+            .padding(.horizontal, 16)
 
-            LazyVGrid(
-                columns: [GridItem(.adaptive(minimum: 150), spacing: 16)],
-                spacing: 20
-            ) {
-                ForEach(viewModel.showGroups) { group in
-                    if group.isSeries {
-                        NavigationLink {
-                            ShowDetailView(
-                                groupID: group.id,
-                                fallbackGroup: group,
-                                viewModel: viewModel,
-                                onPlay: { item in
-                                    play(item, in: group.items)
-                                }
-                            )
-                        } label: {
-                            ShowCard(group: group)
-                        }
-                        .buttonStyle(.plain)
-                        .contextMenu {
-                            Button {
-                                coverFinderTarget = CoverFinderTarget(
-                                    id: group.id,
-                                    rawTitle: group.rawTitle,
-                                    displayTitle: group.title
+            if !authManager.isAuthenticated {
+                driveSignInCard
+            } else if viewModel.isLoading && viewModel.items.isEmpty {
+                HStack(spacing: 12) {
+                    ProgressView()
+                    Text("Scanning Google Drive…")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .padding(16)
+                .background(Color.white.opacity(0.05))
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .padding(.horizontal, 16)
+            } else if viewModel.showGroups.isEmpty && viewModel.errorMessage == nil {
+                VStack(alignment: .leading, spacing: 10) {
+                    Label("No Videos Found", systemImage: "film.stack")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white)
+                    Text(folderID.isEmpty ? "No video files were found in your Google Drive." : "No videos found in the configured Folder ID. Check Settings or tap Refresh.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button {
+                        Task { await reload() }
+                    } label: {
+                        Label("Refresh Google Drive", systemImage: "arrow.clockwise")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(16)
+                .background(Color.white.opacity(0.05))
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .padding(.horizontal, 16)
+            } else {
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: 150), spacing: 16)],
+                    spacing: 20
+                ) {
+                    ForEach(viewModel.showGroups) { group in
+                        if group.isSeries {
+                            NavigationLink {
+                                ShowDetailView(
+                                    groupID: group.id,
+                                    fallbackGroup: group,
+                                    viewModel: viewModel,
+                                    onPlay: { item in
+                                        play(item, in: group.items)
+                                    }
                                 )
                             } label: {
-                                Label("Find Cover / Match Show", systemImage: "wand.and.stars")
+                                ShowCard(group: group)
                             }
-                        }
-                    } else if let singleItem = group.items.first {
-                        Button {
-                            play(singleItem, in: group.items)
-                        } label: {
-                            ShowCard(group: group)
-                        }
-                        .buttonStyle(.plain)
-                        .contextMenu {
+                            .buttonStyle(.plain)
+                            .contextMenu {
+                                Button {
+                                    coverFinderTarget = CoverFinderTarget(
+                                        id: group.id,
+                                        rawTitle: group.rawTitle,
+                                        displayTitle: group.title
+                                    )
+                                } label: {
+                                    Label("Find Cover / Match Show", systemImage: "wand.and.stars")
+                                }
+                            }
+                        } else if let singleItem = group.items.first {
                             Button {
-                                coverFinderTarget = CoverFinderTarget(
-                                    id: group.id,
-                                    rawTitle: group.rawTitle,
-                                    displayTitle: group.title
-                                )
+                                play(singleItem, in: group.items)
                             } label: {
-                                Label("Find Cover / Match Show", systemImage: "wand.and.stars")
+                                ShowCard(group: group)
+                            }
+                            .buttonStyle(.plain)
+                            .contextMenu {
+                                Button {
+                                    coverFinderTarget = CoverFinderTarget(
+                                        id: group.id,
+                                        rawTitle: group.rawTitle,
+                                        displayTitle: group.title
+                                    )
+                                } label: {
+                                    Label("Find Cover / Match Show", systemImage: "wand.and.stars")
+                                }
                             }
                         }
                     }
                 }
+                .padding(.horizontal, 16)
             }
-            .padding(.horizontal, 16)
         }
+    }
+
+    private var driveSignInCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("Connect Google Drive", systemImage: "externaldrive.badge.icloud")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.white)
+            Text("Sign in with Google to stream your Shows & Movies below your Web Links.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if let error = authManager.authError {
+                Text(error)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+            }
+            Button {
+                Task { await authManager.signIn() }
+            } label: {
+                HStack(spacing: 8) {
+                    if authManager.isSigningIn {
+                        ProgressView()
+                            .controlSize(.small)
+                            .tint(.black)
+                    } else {
+                        Image(systemName: "person.crop.circle.badge.checkmark")
+                    }
+                    Text(authManager.isSigningIn ? "Signing In…" : "Sign in with Google")
+                        .fontWeight(.semibold)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+                .background(Color.white)
+                .foregroundStyle(.black)
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
+            .disabled(authManager.isSigningIn)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .background(Color.white.opacity(0.05))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .padding(.horizontal, 16)
     }
 
     private func errorBanner(_ message: String) -> some View {
@@ -682,6 +779,7 @@ private struct LibraryHomeView: View {
     }
 
     private func reload() async {
+        guard authManager.isAuthenticated else { return }
         await viewModel.loadLibrary(
             authManager: authManager,
             folderID: folderID
@@ -1230,11 +1328,20 @@ private struct SettingsView: View {
                 }
 
                 Section("Account") {
-                    Button(role: .destructive) {
-                        authManager.signOut()
-                        dismiss()
-                    } label: {
-                        Text("Sign Out of Google")
+                    if authManager.isAuthenticated {
+                        Button(role: .destructive) {
+                            authManager.signOut()
+                            dismiss()
+                        } label: {
+                            Text("Sign Out of Google")
+                        }
+                    } else {
+                        Button {
+                            dismiss()
+                            Task { await authManager.signIn() }
+                        } label: {
+                            Text("Sign in with Google")
+                        }
                     }
                 }
             }

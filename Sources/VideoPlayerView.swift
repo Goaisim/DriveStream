@@ -123,6 +123,7 @@ struct VideoPlayerView: View {
     let episodes: [PlayerEpisode]
     let initialEpisode: PlayerEpisode
     let engine: PlaybackEngine
+    var persistProgress: Bool = true
 
     @Environment(\.dismiss) private var dismiss
 
@@ -135,7 +136,11 @@ struct VideoPlayerView: View {
         case .avPlayer(let asset):
             ZStack(alignment: .topLeading) {
                 Color.black.ignoresSafeArea()
-                AVPlayerViewControllerWrapper(fileId: initialEpisode.id, asset: asset)
+                AVPlayerViewControllerWrapper(
+                    fileId: initialEpisode.id,
+                    asset: asset,
+                    persistProgress: persistProgress
+                )
                     .ignoresSafeArea()
                 Button {
                     dismiss()
@@ -1073,9 +1078,10 @@ private struct VLCPlayerContainerView: View {
 private struct AVPlayerViewControllerWrapper: UIViewControllerRepresentable {
     let fileId: String
     let asset: AVURLAsset
+    var persistProgress: Bool = true
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(fileId: fileId)
+        Coordinator(fileId: fileId, persistProgress: persistProgress)
     }
 
     func makeUIViewController(context: Context) -> AVPlayerViewController {
@@ -1114,18 +1120,22 @@ private struct AVPlayerViewControllerWrapper: UIViewControllerRepresentable {
     @MainActor
     final class Coordinator {
         private let fileId: String
+        private let persistProgress: Bool
         private weak var player: AVPlayer?
         private var timeObserverToken: Any?
         private var statusObservation: NSKeyValueObservation?
         private var timeControlStatusObservation: NSKeyValueObservation?
         private var didSeekToSavedPosition = false
 
-        nonisolated init(fileId: String) {
+        nonisolated init(fileId: String, persistProgress: Bool) {
             self.fileId = fileId
+            self.persistProgress = persistProgress
         }
 
         func configure(player: AVPlayer, item: AVPlayerItem) {
             self.player = player
+
+            guard persistProgress else { return }
 
             if let saved = PlaybackStore.shared.progress(for: fileId),
                saved.position > 1,
@@ -1159,7 +1169,7 @@ private struct AVPlayerViewControllerWrapper: UIViewControllerRepresentable {
         }
 
         func persistCurrentTime() {
-            guard let player, let item = player.currentItem else { return }
+            guard persistProgress, let player, let item = player.currentItem else { return }
             let current = player.currentTime().seconds
             let duration = item.duration.seconds
             PlaybackStore.shared.save(
@@ -1170,8 +1180,10 @@ private struct AVPlayerViewControllerWrapper: UIViewControllerRepresentable {
         }
 
         func teardown() {
-            persistCurrentTime()
-            SyncManager.shared.scheduleSyncAfterChange()
+            if persistProgress {
+                persistCurrentTime()
+                SyncManager.shared.scheduleSyncAfterChange()
+            }
             statusObservation?.invalidate()
             statusObservation = nil
             timeControlStatusObservation?.invalidate()

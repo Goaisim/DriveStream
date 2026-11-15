@@ -90,7 +90,12 @@ data class PlayerEpisode(
     val shortTitle: String,
     val subtitle: String?,
     val episodeCode: String?,
-    val stillUrl: String?
+    val stillUrl: String?,
+    val streamUrl: String? = null,
+    val referer: String = "",
+    val origin: String = "",
+    val userAgent: String = "",
+    val isLiveStream: Boolean = false
 )
 
 private data class VlcTrackOption(
@@ -166,11 +171,18 @@ fun VlcPlayerScreen(
     val selectableSubtitles = subtitleTracks.filter { it.id != -1 }
 
     fun saveProgress(force: Boolean) {
+        if (currentEpisode.isLiveStream) return
         if (currentTimeSec <= 0.0 && !force) return
         val now = System.currentTimeMillis()
         if (!force && now - lastSavedAtMs < 5_000L) return
         lastSavedAtMs = now
         playbackStore.save(currentEpisode.id, currentTimeSec, durationSec)
+    }
+
+    fun persistAndSyncProgress() {
+        if (currentEpisode.isLiveStream) return
+        saveProgress(force = true)
+        syncManager.scheduleSyncAfterChange()
     }
 
     fun seekTo(targetSec: Double) {
@@ -260,7 +272,8 @@ fun VlcPlayerScreen(
         didAttemptResume = false
         seekIgnoreUntilMs = 0L
         errorMessage = null
-        statusMessage = "Connecting to Drive proxy…"
+        val directUrl = episode.streamUrl?.trim()?.takeIf { it.isNotEmpty() }
+        statusMessage = if (directUrl != null) "Connecting to live stream…" else "Connecting to Drive proxy…"
 
         if (!proxy.ensureStarted()) {
             isLoading = false
@@ -268,7 +281,17 @@ fun VlcPlayerScreen(
             return
         }
 
-        val streamUri = Uri.parse(proxy.streamUrl(episode.id))
+        val resolvedUrl = if (directUrl != null) {
+            val sid = proxy.registerHlsSession(
+                referer = episode.referer,
+                origin = episode.origin,
+                userAgent = episode.userAgent
+            )
+            proxy.hlsStreamUrl(directUrl, sid)
+        } else {
+            proxy.streamUrl(episode.id)
+        }
+        val streamUri = Uri.parse(resolvedUrl)
         val media = Media(libVlc, streamUri).apply {
             addOption(":network-caching=2000")
             addOption(":no-sub-autodetect-file")
@@ -317,8 +340,7 @@ fun VlcPlayerScreen(
 
                     MediaPlayer.Event.Paused -> {
                         isPlaying = false
-                        saveProgress(force = true)
-                        syncManager.scheduleSyncAfterChange()
+                        persistAndSyncProgress()
                     }
 
                     MediaPlayer.Event.Vout, MediaPlayer.Event.ESAdded -> {
@@ -348,7 +370,7 @@ fun VlcPlayerScreen(
                         if (len > 0L) {
                             durationSec = len / 1000.0
                         }
-                        if (!didAttemptResume && durationSec > 0.0) {
+                        if (!currentEpisode.isLiveStream && !didAttemptResume && durationSec > 0.0) {
                             didAttemptResume = true
                             val saved = playbackStore.progress(currentEpisode.id)
                             if (saved != null && saved.position > 1.0 && saved.position / durationSec < 0.95) {
@@ -365,8 +387,7 @@ fun VlcPlayerScreen(
 
                     MediaPlayer.Event.EndReached -> {
                         isPlaying = false
-                        saveProgress(force = true)
-                        syncManager.scheduleSyncAfterChange()
+                        persistAndSyncProgress()
                         if (hasNext) {
                             startEpisode(queue[currentIndex + 1])
                         }
@@ -383,8 +404,7 @@ fun VlcPlayerScreen(
 
         onDispose {
             isPlayerDisposed = true
-            saveProgress(force = true)
-            syncManager.scheduleSyncAfterChange()
+            persistAndSyncProgress()
             mediaPlayer.setEventListener(null)
             mediaPlayer.stop()
             mediaPlayer.detachViews()
@@ -654,7 +674,11 @@ fun VlcPlayerScreen(
                         ) {
                             Text(formatDuration(currentTimeSec), color = Color.White, fontSize = 13.sp)
                             Text(
-                                text = if (durationSec > 0.0) formatDuration(durationSec) else "--:--",
+                                text = when {
+                                    durationSec > 0.0 -> formatDuration(durationSec)
+                                    currentEpisode.isLiveStream -> "LIVE"
+                                    else -> "--:--"
+                                },
                                 color = Color.White.copy(alpha = 0.75f),
                                 fontSize = 13.sp
                             )

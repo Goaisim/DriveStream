@@ -432,6 +432,7 @@ fun TvMainScreen(libraryViewModel: LibraryViewModel = viewModel()) {
                             authManager.refreshLocalIp()
                             if (isAuthenticated) libraryViewModel.loadLibrary(folderId)
                         },
+                        onSignIn = { authManager.launchTvBrowserSignIn(context) },
                         onOpenSettings = {
                             authManager.refreshLocalIp()
                             showSettingsDialog = true
@@ -719,6 +720,7 @@ private fun TvHomeContent(
     onOpenShow: (ShowGroup) -> Unit,
     onOpenCoverFinder: (ShowGroup) -> Unit,
     onRefresh: () -> Unit,
+    onSignIn: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
     val continueWatching = remember(items, progressMap) {
@@ -882,87 +884,151 @@ private fun TvHomeContent(
                     }
                 }
 
-                // Library Grid Rows
-                if (showGroups.isNotEmpty()) {
-                    item(key = "library-header") {
-                        Text(
-                            text = "Library  (Hold OK / Menu to Find Cover)",
-                            color = Color.White,
-                            fontSize = 20.sp,
-                            fontWeight = FontWeight.Bold,
-                            modifier = Modifier.padding(horizontal = 36.dp)
-                        )
+                // Google Drive Library Section (always visible below Web Links)
+                item(key = "library-header") {
+                    Text(
+                        text = if (showGroups.isNotEmpty()) {
+                            "Google Drive Library  (Hold OK / Menu to Find Cover)"
+                        } else {
+                            "Google Drive Library"
+                        },
+                        color = Color.White,
+                        fontSize = 20.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 36.dp)
+                    )
+                }
+
+                when {
+                    !isAuthenticated -> {
+                        item(key = "library-sign-in-hint") {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 36.dp)
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .background(Color(0xFF141621))
+                                    .border(1.dp, Color(0xFF2B324D), RoundedCornerShape(14.dp))
+                                    .padding(24.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Icon(Icons.Default.Tv, contentDescription = null, tint = Color(0xFF60A5FA), modifier = Modifier.size(36.dp))
+                                Text(
+                                    text = "Google Drive Not Connected",
+                                    color = Color.White,
+                                    fontSize = 17.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    text = "Sign in to load your Google Drive Shows & Movies below Web Links, or open $companionUrl from your phone or PC.",
+                                    color = Color(0xFF9CA3AF),
+                                    fontSize = 14.sp,
+                                    textAlign = TextAlign.Center
+                                )
+                                TvActionButton(
+                                    label = "Sign in on TV Browser",
+                                    icon = Icons.Default.PlayArrow,
+                                    isPrimary = true,
+                                    onClick = onSignIn
+                                )
+                            }
+                        }
                     }
-                    val chunked = showGroups.chunked(5)
-                    items(chunked.size, key = { idx -> "row-$idx" }) { rowIdx ->
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 36.dp),
-                            horizontalArrangement = Arrangement.spacedBy(18.dp)
-                        ) {
-                            val rowGroups = chunked[rowIdx]
-                            rowGroups.forEach { group ->
-                                Box(modifier = Modifier.weight(1f)) {
-                                    ShowTvCard(
-                                        group = group,
-                                        onClick = {
-                                            if (group.isSeries) {
-                                                onOpenShow(group)
-                                            } else {
-                                                group.items.firstOrNull()?.let { single ->
-                                                    onPlayItem(single, group.items)
+
+                    isLoading && items.isEmpty() -> {
+                        item(key = "library-loading-inline") {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 36.dp)
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .background(Color(0xFF141621))
+                                    .padding(24.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(14.dp)
+                            ) {
+                                CircularProgressIndicator(
+                                    color = Color(0xFF3B82F6),
+                                    modifier = Modifier.size(26.dp)
+                                )
+                                Text(
+                                    text = "Scanning Google Drive…",
+                                    color = Color(0xFFD1D5DB),
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.Medium
+                                )
+                            }
+                        }
+                    }
+
+                    showGroups.isNotEmpty() -> {
+                        val chunked = showGroups.chunked(5)
+                        items(chunked.size, key = { idx -> "row-$idx" }) { rowIdx ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 36.dp),
+                                horizontalArrangement = Arrangement.spacedBy(18.dp)
+                            ) {
+                                val rowGroups = chunked[rowIdx]
+                                rowGroups.forEach { group ->
+                                    Box(modifier = Modifier.weight(1f)) {
+                                        ShowTvCard(
+                                            group = group,
+                                            onClick = {
+                                                if (group.isSeries) {
+                                                    onOpenShow(group)
+                                                } else {
+                                                    group.items.firstOrNull()?.let { single ->
+                                                        onPlayItem(single, group.items)
+                                                    }
                                                 }
-                                            }
-                                        },
-                                        onLongClick = { onOpenCoverFinder(group) }
-                                    )
+                                            },
+                                            onLongClick = { onOpenCoverFinder(group) }
+                                        )
+                                    }
+                                }
+                                repeat(5 - rowGroups.size) {
+                                    Spacer(modifier = Modifier.weight(1f))
                                 }
                             }
-                            repeat(5 - rowGroups.size) {
-                                Spacer(modifier = Modifier.weight(1f))
+                        }
+                    }
+
+                    errorMessage == null -> {
+                        item(key = "empty-library-hint") {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 36.dp)
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .background(Color(0xFF141621))
+                                    .padding(24.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Icon(Icons.Default.Tv, contentDescription = null, tint = Color(0xFF6B7280), modifier = Modifier.size(40.dp))
+                                Text(
+                                    text = "No Google Drive Videos Yet",
+                                    color = Color.White,
+                                    fontSize = 17.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    text = "Upload videos to Google Drive (or check folder ID in Settings) and tap Refresh.",
+                                    color = Color(0xFF9CA3AF),
+                                    fontSize = 14.sp,
+                                    textAlign = TextAlign.Center
+                                )
+                                TvActionButton(
+                                    label = "Refresh Drive Library",
+                                    icon = Icons.Default.Refresh,
+                                    onClick = onRefresh
+                                )
                             }
                         }
                     }
-                }
-                if (!isLoading && items.isEmpty() && errorMessage == null) {
-                    item(key = "empty-library-hint") {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 36.dp, vertical = 20.dp)
-                                .clip(RoundedCornerShape(14.dp))
-                                .background(Color(0xFF141621))
-                                .padding(24.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Icon(Icons.Default.Tv, contentDescription = null, tint = Color(0xFF6B7280), modifier = Modifier.size(40.dp))
-                            Text(
-                                text = if (isAuthenticated) "No Google Drive Videos Yet" else "Signed Out (Web Links & Quick Test Ready Above)",
-                                color = Color.White,
-                                fontSize = 17.sp,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                            Text(
-                                text = "Press Add Link above or open $companionUrl from your phone or PC.",
-                                color = Color(0xFF9CA3AF),
-                                fontSize = 14.sp,
-                                textAlign = TextAlign.Center
-                            )
-                        }
-                    }
-                }
-            }
-
-            if (isLoading && items.isEmpty()) {
-                Column(
-                    modifier = Modifier.align(Alignment.Center),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    CircularProgressIndicator(color = Color(0xFF3B82F6))
-                    Text("Scanning Google Drive…", color = Color(0xFF9CA3AF), fontSize = 15.sp)
                 }
             }
         }

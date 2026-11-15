@@ -9,8 +9,8 @@ import WebKit
 final class AdBlockEngine {
     static let shared = AdBlockEngine()
 
-    private static let baseRuleIdentifier = "DriveStreamBaseBlocker_v1"
-    private static let yoyoRuleIdentifier = "DriveStreamYoyoBlocker_v1"
+    private static let baseRuleIdentifier = "DriveStreamBaseBlocker_v2"
+    private static let yoyoRuleIdentifier = "DriveStreamYoyoBlocker_v2"
     private static let yoyoURL = URL(string: "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=nohtml&showintro=0")!
     private static let cacheFileName = "yoyo_ad_domains.txt"
     private static let cacheTTL: TimeInterval = 60 * 60 * 24
@@ -40,18 +40,38 @@ final class AdBlockEngine {
         "revcontent.com"
     ]
 
-    private static let blockedURLPatterns: [String] = [
-        "/ads/",
-        "/adserver",
-        "/popunder",
-        "/pop\\.js",
-        "banner\\.js",
-        "prebid",
-        "vast\\.xml"
+    private static let baseBlockedDomainSet: Set<String> = Set(baseBlockedDomains)
+
+    nonisolated static let streamingBypassTokens: [String] = [
+        ".m3u8", ".ts", ".m4s", ".mp4", ".mpd", ".aac", ".key",
+        "blob:", "data:", "ws:", "wss:",
+        "jwplayer", "clappr", "hls.js", "video.js",
+        "embed", "player", "stream"
+    ]
+
+    nonisolated private static let mediaBypassRegexes: [String] = [
+        "^https?://[^/?#]+[/?][^#]*\\.m3u8",
+        "^https?://[^/?#]+[/?][^#]*\\.ts",
+        "^https?://[^/?#]+[/?][^#]*\\.m4s",
+        "^https?://[^/?#]+[/?][^#]*\\.mp4",
+        "^https?://[^/?#]+[/?][^#]*\\.mpd",
+        "^https?://[^/?#]+[/?][^#]*\\.aac",
+        "^https?://[^/?#]+[/?][^#]*\\.key",
+        "^https?://[^/?#]+[/?][^#]*blob:",
+        "^https?://[^/?#]+[/?][^#]*data:",
+        "^https?://[^/?#]+[/?][^#]*ws:",
+        "^https?://[^/?#]+[/?][^#]*wss:",
+        "^https?://[^/?#]+[/?][^#]*jwplayer",
+        "^https?://[^/?#]+[/?][^#]*clappr",
+        "^https?://[^/?#]+[/?][^#]*hls\\.js",
+        "^https?://[^/?#]+[/?][^#]*video\\.js",
+        "^https?://[^/?#]+[/?][^#]*embed",
+        "^https?://[^/?#]+[/?][^#]*player",
+        "^https?://[^/?#]+[/?][^#]*stream"
     ]
 
     private static let hiddenCSSSelector =
-        ".ad, .ads, .adsbygoogle, [id^=\"google_ads\"], [class*=\"popup\"], [id*=\"popup\"], iframe[src*=\"ads\"], iframe[src*=\"doubleclick\"]"
+        ".ad, .ads, .adsbygoogle, [id^=\"google_ads\"], [class*=\"popup\"]:not(.jwplayer):not(.jw-wrapper):not(.clappr-player):not([data-player]):not([class*=\"player\"]):not([id*=\"player\"]):not([class*=\"jw-\"]), [id*=\"popup\"]:not(.jwplayer):not(.jw-wrapper):not(.clappr-player):not([data-player]):not([class*=\"player\"]):not([id*=\"player\"]):not([class*=\"jw-\"]), iframe[src*=\"/ads/\"], iframe[src*=\"doubleclick\"]"
 
     private(set) var blockedDomains: Set<String>
     private(set) var baseRuleList: WKContentRuleList?
@@ -77,18 +97,37 @@ final class AdBlockEngine {
     }
 
     func isBlockedHost(_ host: String) -> Bool {
+        matchesDomainSet(host, in: blockedDomains)
+    }
+
+    func isBaseBlockedHost(_ host: String) -> Bool {
+        matchesDomainSet(host, in: Self.baseBlockedDomainSet)
+    }
+
+    private func matchesDomainSet(_ host: String, in domainSet: Set<String>) -> Bool {
         let lower = host.lowercased()
-        if blockedDomains.contains(lower) {
+        if domainSet.contains(lower) {
             return true
         }
         var slice = lower[...]
         while let dot = slice.firstIndex(of: ".") {
             slice = slice[slice.index(after: dot)...]
-            if slice.contains("."), blockedDomains.contains(String(slice)) {
+            if slice.contains("."), domainSet.contains(String(slice)) {
                 return true
             }
         }
         return false
+    }
+
+    nonisolated func isStreamingOrPlayerURL(_ url: URL) -> Bool {
+        let scheme = url.scheme?.lowercased() ?? ""
+        if scheme == "blob" || scheme == "data" || scheme == "ws" || scheme == "wss" {
+            return true
+        }
+        let path = url.path.lowercased()
+        let query = url.query?.lowercased() ?? ""
+        let pathAndQuery = query.isEmpty ? path : "\(path)?\(query)"
+        return Self.streamingBypassTokens.contains { pathAndQuery.contains($0) }
     }
 
     func ensureBaseRulesCompiled() async -> WKContentRuleList? {
@@ -225,31 +264,8 @@ final class AdBlockEngine {
     }
 
     private static func buildBaseRuleJSON() -> String? {
-        var rules: [[String: Any]] = []
-
-        for domain in baseBlockedDomains {
-            let escaped = domain.replacingOccurrences(of: ".", with: "\\.")
-            rules.append([
-                "trigger": [
-                    "url-filter": "^https?://([^/:]*\\.)?\(escaped)[:/?#]"
-                ],
-                "action": [
-                    "type": "block"
-                ]
-            ])
-        }
-
-        for pattern in blockedURLPatterns {
-            rules.append([
-                "trigger": [
-                    "url-filter": pattern
-                ],
-                "action": [
-                    "type": "block"
-                ]
-            ])
-        }
-
+        var rules = domainBlockRuleObjects(for: baseBlockedDomains)
+        rules.append(contentsOf: mediaBypassRuleObjects())
         rules.append([
             "trigger": [
                 "url-filter": ".*"
@@ -267,22 +283,41 @@ final class AdBlockEngine {
     }
 
     nonisolated private static func buildDomainBlockJSON(for domains: [String]) -> String? {
-        let rules: [[String: Any]] = domains.map { domain in
+        var rules = domainBlockRuleObjects(for: domains)
+        guard !rules.isEmpty else { return nil }
+        rules.append(contentsOf: mediaBypassRuleObjects())
+        guard let data = try? JSONSerialization.data(withJSONObject: rules) else {
+            return nil
+        }
+        return String(data: data, encoding: .utf8)
+    }
+
+    nonisolated private static func domainBlockRuleObjects(for domains: [String]) -> [[String: Any]] {
+        domains.map { domain in
             let escaped = domain.replacingOccurrences(of: ".", with: "\\.")
             return [
                 "trigger": [
-                    "url-filter": "^https?://([^/:]*\\.)?\(escaped)[:/?#]"
+                    "url-filter": "^https?://([^/:]*\\.)?\(escaped)[:/?#]",
+                    "load-type": ["third-party"]
                 ],
                 "action": [
                     "type": "block"
                 ]
             ]
         }
-        guard !rules.isEmpty,
-              let data = try? JSONSerialization.data(withJSONObject: rules) else {
-            return nil
+    }
+
+    nonisolated private static func mediaBypassRuleObjects() -> [[String: Any]] {
+        mediaBypassRegexes.map { pattern in
+            [
+                "trigger": [
+                    "url-filter": pattern
+                ],
+                "action": [
+                    "type": "ignore-previous-rules"
+                ]
+            ]
         }
-        return String(data: data, encoding: .utf8)
     }
 
     private static func compileRuleList(
@@ -315,6 +350,21 @@ private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
     }
 }
 
+// MARK: - Detected Stream Models
+
+struct DetectedHlsStream: Equatable {
+    let m3u8Url: String
+    let referer: String
+    let origin: String
+    let userAgent: String
+}
+
+struct NativeStreamPlayback: Identifiable {
+    let id = UUID()
+    let title: String
+    let asset: AVURLAsset
+}
+
 // MARK: - Browser View Model (Layers 2 & 3 + Navigation State)
 
 @MainActor
@@ -329,6 +379,7 @@ private final class AdBlockBrowserViewModel: NSObject, ObservableObject, WKNavig
     @Published private(set) var estimatedProgress: Double = 0
     @Published var strictRedirectLock = true
     @Published private(set) var blockedCount = 0
+    @Published private(set) var detectedStream: DetectedHlsStream?
 
     private let initialURL: URL
     private var allowedRootDomain: String?
@@ -338,6 +389,8 @@ private final class AdBlockBrowserViewModel: NSObject, ObservableObject, WKNavig
     private var observers: [NSKeyValueObservation] = []
 
     private static let messageHandlerName = "adBlocker"
+    private static let mobileSafariUA =
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
 
     init(initialURL: URL) {
         self.initialURL = initialURL
@@ -346,6 +399,7 @@ private final class AdBlockBrowserViewModel: NSObject, ObservableObject, WKNavig
         self.allowedRootDomain = Self.rootDomain(for: initialURL.host)
 
         let config = WKWebViewConfiguration()
+        config.websiteDataStore = WKWebsiteDataStore.default()
         config.allowsInlineMediaPlayback = true
         config.allowsPictureInPictureMediaPlayback = true
         config.allowsAirPlayForMediaPlayback = true
@@ -368,6 +422,7 @@ private final class AdBlockBrowserViewModel: NSObject, ObservableObject, WKNavig
         webView.backgroundColor = darkColor
         webView.scrollView.backgroundColor = darkColor
         webView.allowsBackForwardNavigationGestures = true
+        webView.customUserAgent = Self.mobileSafariUA
         self.webView = webView
 
         super.init()
@@ -424,6 +479,7 @@ private final class AdBlockBrowserViewModel: NSObject, ObservableObject, WKNavig
         allowedRootDomain = Self.rootDomain(for: url.host)
         currentURL = url
         addressText = url.absoluteString
+        detectedStream = nil
         webView.load(URLRequest(url: url))
     }
 
@@ -436,16 +492,19 @@ private final class AdBlockBrowserViewModel: NSObject, ObservableObject, WKNavig
     func goBack() {
         guard webView.canGoBack else { return }
         allowBackForwardCrossDomain = true
+        detectedStream = nil
         webView.goBack()
     }
 
     func goForward() {
         guard webView.canGoForward else { return }
         allowBackForwardCrossDomain = true
+        detectedStream = nil
         webView.goForward()
     }
 
     func reload() {
+        detectedStream = nil
         if webView.url != nil {
             webView.reload()
         } else {
@@ -461,6 +520,35 @@ private final class AdBlockBrowserViewModel: NSObject, ObservableObject, WKNavig
         }
     }
 
+    func buildNativePlayback() async -> NativeStreamPlayback? {
+        guard let stream = detectedStream,
+              let url = URL(string: stream.m3u8Url) else {
+            return nil
+        }
+
+        webView.evaluateJavaScript(
+            "document.querySelectorAll('video').forEach(function(v){try{v.pause();}catch(e){}});",
+            completionHandler: nil
+        )
+
+        var headers: [String: String] = [:]
+        if !stream.referer.isEmpty { headers["Referer"] = stream.referer }
+        if !stream.origin.isEmpty { headers["Origin"] = stream.origin }
+        if !stream.userAgent.isEmpty { headers["User-Agent"] = stream.userAgent }
+
+        let cookies = await webView.configuration.websiteDataStore.httpCookieStore.allCookies()
+        var options: [String: Any] = ["AVURLAssetHTTPHeaderFieldsKey": headers]
+        if !cookies.isEmpty {
+            options[AVURLAssetHTTPCookiesKey] = cookies
+        }
+
+        let asset = AVURLAsset(url: url, options: options)
+        let title = (webView.title?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+            ? webView.title!
+            : (url.host ?? "Live Stream")
+        return NativeStreamPlayback(title: title, asset: asset)
+    }
+
     // MARK: - WKUIDelegate (Popup & Alert Blocking)
 
     func webView(
@@ -469,21 +557,20 @@ private final class AdBlockBrowserViewModel: NSObject, ObservableObject, WKNavig
         for navigationAction: WKNavigationAction,
         windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
-        blockedCount += 1
-
-        guard navigationAction.navigationType == .linkActivated,
-              let targetURL = navigationAction.request.url,
-              let scheme = targetURL.scheme?.lowercased(),
-              scheme == "http" || scheme == "https",
-              let targetHost = targetURL.host,
-              !AdBlockEngine.shared.isBlockedHost(targetHost),
-              let currentRoot = Self.rootDomain(for: (webView.url ?? currentURL)?.host),
-              let targetRoot = Self.rootDomain(for: targetHost),
-              targetRoot == currentRoot else {
+        if navigationAction.navigationType == .linkActivated,
+           let targetURL = navigationAction.request.url,
+           let scheme = targetURL.scheme?.lowercased(),
+           scheme == "http" || scheme == "https",
+           let targetHost = targetURL.host,
+           !AdBlockEngine.shared.isBlockedHost(targetHost),
+           let currentRoot = Self.rootDomain(for: (webView.url ?? currentURL)?.host),
+           let targetRoot = Self.rootDomain(for: targetHost),
+           targetRoot == currentRoot {
+            webView.load(navigationAction.request)
             return nil
         }
 
-        webView.load(navigationAction.request)
+        blockedCount += 1
         return nil
     }
 
@@ -509,15 +596,18 @@ private final class AdBlockBrowserViewModel: NSObject, ObservableObject, WKNavig
             return
         }
 
+        if AdBlockEngine.shared.isStreamingOrPlayerURL(url) {
+            decisionHandler(.allow)
+            return
+        }
+
         let scheme = url.scheme?.lowercased() ?? ""
-        let isMainFrame = navigationAction.targetFrame?.isMainFrame ?? true
+        let isMainFrame = navigationAction.targetFrame?.isMainFrame == true
 
         if scheme != "http" && scheme != "https" {
             let allowedSubframeInternal = !isMainFrame && (
                 url.absoluteString == "about:blank" ||
-                url.absoluteString == "about:srcdoc" ||
-                scheme == "blob" ||
-                scheme == "data"
+                url.absoluteString == "about:srcdoc"
             )
             if allowedSubframeInternal {
                 decisionHandler(.allow)
@@ -528,36 +618,48 @@ private final class AdBlockBrowserViewModel: NSObject, ObservableObject, WKNavig
             return
         }
 
+        if !isMainFrame {
+            if let host = url.host, AdBlockEngine.shared.isBaseBlockedHost(host) {
+                blockedCount += 1
+                decisionHandler(.cancel)
+                return
+            }
+            decisionHandler(.allow)
+            return
+        }
+
         if let host = url.host, AdBlockEngine.shared.isBlockedHost(host) {
             blockedCount += 1
             decisionHandler(.cancel)
             return
         }
 
-        if isMainFrame {
-            if navigationAction.navigationType == .backForward && allowBackForwardCrossDomain {
-                allowBackForwardCrossDomain = false
-                allowedRootDomain = Self.rootDomain(for: url.host)
-                decisionHandler(.allow)
-                return
-            }
+        if navigationAction.navigationType == .backForward && allowBackForwardCrossDomain {
             allowBackForwardCrossDomain = false
+            allowedRootDomain = Self.rootDomain(for: url.host)
+            decisionHandler(.allow)
+            return
+        }
+        allowBackForwardCrossDomain = false
 
-            if strictRedirectLock,
-               let allowedRoot = allowedRootDomain,
-               let targetRoot = Self.rootDomain(for: url.host),
-               targetRoot != allowedRoot {
-                blockedCount += 1
-                decisionHandler(.cancel)
-                return
-            }
+        if strictRedirectLock,
+           let allowedRoot = allowedRootDomain,
+           let targetRoot = Self.rootDomain(for: url.host),
+           targetRoot != allowedRoot {
+            blockedCount += 1
+            decisionHandler(.cancel)
+            return
+        }
 
-            if !strictRedirectLock, let targetRoot = Self.rootDomain(for: url.host) {
-                allowedRootDomain = targetRoot
-            }
+        if !strictRedirectLock, let targetRoot = Self.rootDomain(for: url.host) {
+            allowedRootDomain = targetRoot
         }
 
         decisionHandler(.allow)
+    }
+
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        detectedStream = nil
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
@@ -575,7 +677,41 @@ private final class AdBlockBrowserViewModel: NSObject, ObservableObject, WKNavig
         didReceive message: WKScriptMessage
     ) {
         guard message.name == Self.messageHandlerName else { return }
+        if let dict = message.body as? [String: Any],
+           let type = dict["type"] as? String,
+           type == "m3u8_detected" {
+            if let m3u8Url = dict["m3u8Url"] as? String, !m3u8Url.isEmpty {
+                let incoming = DetectedHlsStream(
+                    m3u8Url: m3u8Url,
+                    referer: (dict["referer"] as? String) ?? "",
+                    origin: (dict["origin"] as? String) ?? "",
+                    userAgent: (dict["userAgent"] as? String) ?? ""
+                )
+                updateDetectedStream(incoming)
+            }
+            return
+        }
         blockedCount += 1
+    }
+
+    private func updateDetectedStream(_ incoming: DetectedHlsStream) {
+        let lowerNew = incoming.m3u8Url.lowercased()
+        if (lowerNew.contains("audio") || lowerNew.contains("subtitle") || lowerNew.contains("caption")) && detectedStream != nil {
+            return
+        }
+        if let existing = detectedStream,
+           let existingURL = URL(string: existing.m3u8Url),
+           let newURL = URL(string: incoming.m3u8Url),
+           existingURL.host == newURL.host {
+            let lowerOld = existing.m3u8Url.lowercased()
+            let oldIsMaster = lowerOld.contains("master") || lowerOld.contains("playlist") || lowerOld.contains("index")
+            let newIsMaster = lowerNew.contains("master") || lowerNew.contains("playlist") || lowerNew.contains("index")
+            let sameDir = existingURL.deletingLastPathComponent().path == newURL.deletingLastPathComponent().path
+            if oldIsMaster && !newIsMaster && sameDir {
+                return
+            }
+        }
+        detectedStream = incoming
     }
 
     // MARK: - Helpers
@@ -659,19 +795,23 @@ private final class AdBlockBrowserViewModel: NSObject, ObservableObject, WKNavig
         return parts.suffix(2).joined(separator: ".")
     }
 
-    // MARK: - Layer 3: Injected Document-Start Protection Script
+    // MARK: - Layer 3: Injected Player-Safe Popup/Banner Shield & HLS Detector
 
     private static let adBlockUserScript = #"""
     (function() {
         if (window.__dsAdBlockInstalled) { return; }
         window.__dsAdBlockInstalled = true;
 
-        function reportBlock(kind) {
+        function postBridge(payload) {
             try {
                 if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.adBlocker) {
-                    window.webkit.messageHandlers.adBlocker.postMessage({ type: kind });
+                    window.webkit.messageHandlers.adBlocker.postMessage(payload);
                 }
             } catch (e) {}
+        }
+
+        function reportBlock(kind) {
+            postBridge({ type: kind });
         }
 
         // 1. Block window.open popups
@@ -719,150 +859,143 @@ private final class AdBlockBrowserViewModel: NSObject, ObservableObject, WKNavig
             return origAddEventListener.call(this, type, listener, options);
         };
 
-        // 3. Remove transparent click-hijack overlays & auto-click Skip Ad buttons
-        function intersectsVideo(rect, videoRects) {
-            for (let i = 0; i < videoRects.length; i++) {
-                const v = videoRects[i];
-                if (rect.left < v.right && rect.right > v.left && rect.top < v.bottom && rect.bottom > v.top) {
-                    return true;
+        // 3. HLS (.m3u8) live stream detector across all frames
+        function reportM3u8(rawUrl) {
+            try {
+                if (!rawUrl) { return; }
+                const absUrl = new URL(String(rawUrl), location.href).href;
+                const lower = absUrl.toLowerCase();
+                if ((lower.indexOf('http://') !== 0 && lower.indexOf('https://') !== 0) ||
+                    lower.indexOf('.m3u8') === -1) {
+                    return;
                 }
+                postBridge({
+                    type: 'm3u8_detected',
+                    m3u8Url: absUrl,
+                    referer: document.referrer || location.href,
+                    origin: location.origin || '',
+                    userAgent: navigator.userAgent || ''
+                });
+            } catch (e) {}
+        }
+
+        const origXhrOpen = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function(method, url) {
+            reportM3u8(url);
+            return origXhrOpen.apply(this, arguments);
+        };
+
+        if (typeof window.fetch === 'function') {
+            const origFetch = window.fetch;
+            window.fetch = function(input, init) {
+                try {
+                    const target = typeof input === 'string' ? input : (input && input.url ? input.url : '');
+                    reportM3u8(target);
+                } catch (e) {}
+                return origFetch.apply(this, arguments);
+            };
+        }
+
+        function scanMediaElements() {
+            try {
+                const nodes = document.querySelectorAll('video, source');
+                for (let i = 0; i < nodes.length; i++) {
+                    reportM3u8(nodes[i].currentSrc || nodes[i].src);
+                }
+            } catch (e) {}
+        }
+
+        document.addEventListener('loadstart', function(ev) {
+            if (ev && ev.target) {
+                reportM3u8(ev.target.currentSrc || ev.target.src);
             }
+        }, true);
+
+        // 4. Player-safe fake VPN banner shield (never touches video/player elements)
+        const PLAYER_SELECTOR = 'video, iframe, canvas, .jwplayer, .jw-wrapper, [data-player], [id*="player"], [class*="player"], .clappr-player';
+
+        function isOrTouchesPlayer(el) {
+            if (!el || el.nodeType !== 1) { return false; }
+            try {
+                if (el.matches && el.matches(PLAYER_SELECTOR)) { return true; }
+                if (el.closest && el.closest(PLAYER_SELECTOR)) { return true; }
+                if (el.querySelector && el.querySelector(PLAYER_SELECTOR)) { return true; }
+            } catch (e) {}
             return false;
         }
 
-        function isTransparentOverlay(el, style) {
-            const opacity = parseFloat(style.opacity);
-            if (!isNaN(opacity) && opacity < 0.05) {
-                return true;
-            }
-            const bg = (style.backgroundColor || '').toLowerCase();
-            const bgImage = style.backgroundImage || 'none';
-            if ((bg === 'transparent' || bg === 'rgba(0, 0, 0, 0)') && bgImage === 'none') {
-                if (el.tagName === 'A') {
-                    return true;
-                }
-                const text = (el.textContent || '').trim();
-                if (text === '' && !el.querySelector('button, input, select, textarea, svg, img, video')) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        const skipSelectors = [
-            '.ytp-ad-skip-button',
-            '.ytp-ad-skip-button-modern',
-            '.ytp-skip-ad-button',
-            '.vast-skip-button',
-            '.jw-skip',
-            '[class*="skip-ad" i]',
-            '[class*="skip_ad" i]',
-            '[id*="skip-ad" i]',
-            '[id*="skip_ad" i]',
-            '[aria-label*="skip ad" i]'
-        ].join(',');
-
-        function sweepOverlaysAndSkipAds() {
-            if (!document.documentElement) { return; }
-
-            const videos = document.querySelectorAll('video');
-            const videoRects = [];
-            for (let i = 0; i < videos.length; i++) {
-                const r = videos[i].getBoundingClientRect();
-                if (r.width > 40 && r.height > 40) {
-                    videoRects.push(r);
-                }
-            }
-
-            const vw = window.innerWidth || 0;
-            const vh = window.innerHeight || 0;
-
-            const candidates = document.querySelectorAll('div, a');
-            for (let i = 0; i < candidates.length; i++) {
-                const el = candidates[i];
+        function hideFakeVpnBanners() {
+            if (!document.body) { return; }
+            const nodes = document.querySelectorAll('div, section, aside, a, p, span');
+            for (let i = 0; i < nodes.length; i++) {
+                const el = nodes[i];
                 if (!el.isConnected) { continue; }
-                if (el.querySelector('video')) { continue; }
+                if (el.closest && el.closest('[data-ds-banner-hidden="1"]')) { continue; }
+                const tag = el.tagName;
+                if (tag === 'HTML' || tag === 'BODY' || tag === 'MAIN') { continue; }
+                if (isOrTouchesPlayer(el)) { continue; }
 
                 const style = window.getComputedStyle(el);
-                if (!style) { continue; }
-                if (style.display === 'none' || style.visibility === 'hidden' || style.pointerEvents === 'none') {
+                if (!style || style.display === 'none' || style.visibility === 'hidden') { continue; }
+
+                const text = (el.innerText || '').trim();
+                if (!text || text.length > 320) { continue; }
+                if (text.indexOf('VPN Recommended') === -1 &&
+                    text.indexOf('Tap to Install and Continue Watching') === -1) {
                     continue;
                 }
-                const pos = style.position;
-                if (pos !== 'fixed' && pos !== 'absolute') { continue; }
 
-                const z = parseInt(style.zIndex, 10);
-                if (isNaN(z) || z <= 999) { continue; }
-
-                const rect = el.getBoundingClientRect();
-                if (rect.width < 120 || rect.height < 120) { continue; }
-
-                const coversPlayer = intersectsVideo(rect, videoRects) ||
-                    (vw > 0 && vh > 0 && rect.width >= vw * 0.45 && rect.height >= vh * 0.45);
-                if (!coversPlayer) { continue; }
-
-                if (isTransparentOverlay(el, style)) {
-                    el.remove();
-                    reportBlock('overlay');
+                let target = el;
+                while (target.parentElement) {
+                    const parent = target.parentElement;
+                    const pTag = parent.tagName;
+                    if (pTag === 'BODY' || pTag === 'HTML' || pTag === 'MAIN') { break; }
+                    if (isOrTouchesPlayer(parent)) { break; }
+                    const pText = (parent.innerText || '').trim();
+                    if (pText.length > text.length + 12) { break; }
+                    const pRect = parent.getBoundingClientRect();
+                    if (pRect.height > 220) { break; }
+                    target = parent;
                 }
-            }
 
-            function tryClickSkipButton(btn) {
-                if (!btn || btn.disabled || typeof btn.click !== 'function') { return; }
-                if (btn.dataset && btn.dataset.dsSkipped === '1') { return; }
-                const rect = btn.getBoundingClientRect();
-                if (rect.width > 0 && rect.height > 0) {
-                    if (btn.dataset) { btn.dataset.dsSkipped = '1'; }
-                    btn.click();
-                    reportBlock('skip_ad');
-                }
-            }
-
-            const explicitSkipButtons = document.querySelectorAll(skipSelectors);
-            for (let i = 0; i < explicitSkipButtons.length; i++) {
-                tryClickSkipButton(explicitSkipButtons[i]);
-            }
-
-            const genericButtons = document.querySelectorAll('button, [role="button"]');
-            for (let i = 0; i < genericButtons.length; i++) {
-                const btn = genericButtons[i];
-                const label = (btn.innerText || btn.textContent || '').trim();
-                if (/^skip(\s+ads?)?$/i.test(label)) {
-                    tryClickSkipButton(btn);
-                }
+                if (target.dataset && target.dataset.dsBannerHidden === '1') { continue; }
+                target.style.setProperty('display', 'none', 'important');
+                if (target.dataset) { target.dataset.dsBannerHidden = '1'; }
+                reportBlock('vpn_banner');
             }
         }
 
-        let domDirty = true;
+        let bannerTimer = null;
+        function scheduleBannerSweep() {
+            if (bannerTimer) { return; }
+            bannerTimer = setTimeout(function() {
+                bannerTimer = null;
+                hideFakeVpnBanners();
+                scanMediaElements();
+            }, 400);
+        }
+
         const observer = new MutationObserver(function() {
-            domDirty = true;
+            scheduleBannerSweep();
         });
 
-        function attachObserver() {
-            const root = document.documentElement;
+        function startBannerShield() {
+            const root = document.body || document.documentElement;
             if (!root) { return; }
-            observer.observe(root, {
-                childList: true,
-                subtree: true,
-                attributes: true,
-                attributeFilter: ['style', 'class']
-            });
-            sweepOverlaysAndSkipAds();
+            observer.observe(root, { childList: true, subtree: true });
+            hideFakeVpnBanners();
+            scanMediaElements();
         }
 
-        if (document.documentElement) {
-            attachObserver();
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', startBannerShield, { once: true });
         } else {
-            document.addEventListener('DOMContentLoaded', attachObserver, { once: true });
+            startBannerShield();
         }
-        window.addEventListener('load', function() { domDirty = true; }, { once: true });
-
-        setInterval(function() {
-            if (domDirty) {
-                domDirty = false;
-                sweepOverlaysAndSkipAds();
-            }
-        }, 800);
+        window.addEventListener('load', function() {
+            hideFakeVpnBanners();
+            scanMediaElements();
+        }, { once: true });
     })();
     """#
 }
@@ -887,6 +1020,7 @@ struct AdBlockBrowserView: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var viewModel: AdBlockBrowserViewModel
     @FocusState private var isAddressFocused: Bool
+    @State private var nativePlayback: NativeStreamPlayback?
 
     init(initialURL: URL) {
         self.initialURL = initialURL
@@ -914,6 +1048,23 @@ struct AdBlockBrowserView: View {
             if !focused {
                 viewModel.syncAddressBarToCurrentURL()
             }
+        }
+        .fullScreenCover(item: $nativePlayback) { item in
+            let episode = PlayerEpisode(
+                id: item.id.uuidString,
+                title: item.title,
+                shortTitle: item.title,
+                subtitle: "Live HLS",
+                episodeCode: nil,
+                stillURL: nil,
+                prefersVLC: false
+            )
+            VideoPlayerView(
+                episodes: [episode],
+                initialEpisode: episode,
+                engine: .avPlayer(item.asset),
+                persistProgress: false
+            )
         }
         .onDisappear {
             viewModel.teardown()
@@ -1033,7 +1184,49 @@ struct AdBlockBrowserView: View {
             .padding(.vertical, 8)
             .background(Color.white.opacity(0.09))
             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+            if viewModel.detectedStream != nil {
+                Button {
+                    Task {
+                        nativePlayback = await viewModel.buildNativePlayback()
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        Text("⚡ Native Player")
+                            .font(.subheadline.bold())
+                            .foregroundStyle(.white)
+                        Spacer()
+                        Text("60fps HLS • PiP")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(Color.white.opacity(0.88))
+                        Image(systemName: "play.fill")
+                            .font(.caption.bold())
+                            .foregroundStyle(.white)
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 9)
+                    .background(
+                        LinearGradient(
+                            colors: [
+                                Color(red: 0.13, green: 0.78, blue: 0.38),
+                                Color(red: 0.06, green: 0.58, blue: 0.28)
+                            ],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                    )
+                    .overlay(
+                        Capsule()
+                            .stroke(Color(red: 0.45, green: 0.98, blue: 0.62), lineWidth: 1.2)
+                    )
+                    .clipShape(Capsule())
+                    .shadow(color: Color.green.opacity(0.65), radius: 8, x: 0, y: 0)
+                }
+                .accessibilityLabel("Play detected HLS stream in Native Player")
+                .transition(.move(edge: .top).combined(with: .opacity))
+            }
         }
+        .animation(.easeInOut(duration: 0.2), value: viewModel.detectedStream != nil)
         .padding(.horizontal, 12)
         .padding(.top, 8)
         .padding(.bottom, 10)
