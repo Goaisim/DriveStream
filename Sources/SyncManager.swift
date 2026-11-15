@@ -59,7 +59,7 @@ struct DriveStreamSyncState: Codable, Equatable {
         deletedLinkIds = try container.decodeIfPresent([String: Double].self, forKey: .deletedLinkIds) ?? [:]
         watchProgress = try container.decodeIfPresent([String: WatchProgressEntry].self, forKey: .watchProgress) ?? [:]
         customCovers = try container.decodeIfPresent([String: CustomCoverMatch].self, forKey: .customCovers) ?? [:]
-        soulseekBridgeHost = Self.cleanHost(
+        soulseekBridgeHost = SyncManager.cleanHost(
             try container.decodeIfPresent(String.self, forKey: .soulseekBridgeHost) ?? ""
         )
         soulseekBridgeUpdatedAt = try container.decodeIfPresent(Double.self, forKey: .soulseekBridgeUpdatedAt) ?? 0
