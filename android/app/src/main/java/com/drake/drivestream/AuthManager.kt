@@ -55,6 +55,9 @@ class AuthManager private constructor(private val appContext: Context) {
     private val _authError = MutableStateFlow<String?>(null)
     val authError: StateFlow<String?> = _authError.asStateFlow()
 
+    private val _hasAppDataScope = MutableStateFlow(storedHasAppDataScope())
+    val hasAppDataScope: StateFlow<Boolean> = _hasAppDataScope.asStateFlow()
+
     private var companionServer: CompanionWebServer? = null
 
     private val _companionUrl = MutableStateFlow("http://${detectLocalIpAddress()}:$COMPANION_PORT")
@@ -66,13 +69,24 @@ class AuthManager private constructor(private val appContext: Context) {
         return !access.isNullOrBlank() || !refresh.isNullOrBlank()
     }
 
+    private fun storedHasAppDataScope(): Boolean {
+        val scopes = prefs.getString(KEY_GRANTED_SCOPES, "").orEmpty()
+        return scopes.split(Regex("\\s+")).any { it == APPDATA_SCOPE || it.endsWith("/drive.appdata") }
+    }
+
+    fun markAppDataScopeRevoked() {
+        prefs.edit().remove(KEY_GRANTED_SCOPES).apply()
+        _hasAppDataScope.value = false
+    }
+
     fun startCompanionServer() {
         refreshLocalIp()
         if (companionServer == null) {
             companionServer = CompanionWebServer(
                 authManager = this,
                 savedLinksManager = SavedLinksManager.getInstance(appContext),
-                driveSettings = DriveSettings.getInstance(appContext)
+                driveSettings = DriveSettings.getInstance(appContext),
+                syncManager = SyncManager.getInstance(appContext)
             ).also { it.start() }
         }
     }
@@ -251,9 +265,12 @@ class AuthManager private constructor(private val appContext: Context) {
             .remove(KEY_ACCESS_TOKEN)
             .remove(KEY_REFRESH_TOKEN)
             .remove(KEY_EXPIRATION_MS)
+            .remove(KEY_GRANTED_SCOPES)
             .apply()
         _isAuthenticated.value = false
+        _hasAppDataScope.value = false
         _authError.value = null
+        SyncManager.getInstance(appContext).resetCloudStateOnSignOut()
     }
 
     private fun executeTokenRequest(body: FormBody): JSONObject {
@@ -278,14 +295,21 @@ class AuthManager private constructor(private val appContext: Context) {
         val accessToken = json.getString("access_token")
         val expiresInSec = json.optLong("expires_in", 3600L)
         val refreshToken = json.optString("refresh_token", "")
+        val scopeStr = json.optString("scope", "")
 
         prefs.edit().apply {
             putString(KEY_ACCESS_TOKEN, accessToken)
             if (refreshToken.isNotBlank()) {
                 putString(KEY_REFRESH_TOKEN, refreshToken)
             }
+            if (scopeStr.isNotBlank()) {
+                putString(KEY_GRANTED_SCOPES, scopeStr)
+            }
             putLong(KEY_EXPIRATION_MS, System.currentTimeMillis() + expiresInSec * 1000L)
             apply()
+        }
+        if (scopeStr.isNotBlank()) {
+            _hasAppDataScope.value = storedHasAppDataScope()
         }
     }
 
@@ -305,13 +329,15 @@ class AuthManager private constructor(private val appContext: Context) {
         const val CLIENT_ID = "134960325804-ohug3donf2m9l58oj794tah7f0il4arb.apps.googleusercontent.com"
         const val REDIRECT_SCHEME = "com.googleusercontent.apps.134960325804-ohug3donf2m9l58oj794tah7f0il4arb"
         const val REDIRECT_URI = "$REDIRECT_SCHEME:/oauthredirect"
-        const val SCOPE = "https://www.googleapis.com/auth/drive.readonly"
+        const val APPDATA_SCOPE = "https://www.googleapis.com/auth/drive.appdata"
+        const val SCOPE = "https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.appdata"
         const val COMPANION_PORT = 8766
 
         private const val KEY_ACCESS_TOKEN = "oauth_access_token"
         private const val KEY_REFRESH_TOKEN = "oauth_refresh_token"
         private const val KEY_EXPIRATION_MS = "oauth_expiration_ms"
         private const val KEY_PENDING_VERIFIER = "pending_pkce_verifier"
+        private const val KEY_GRANTED_SCOPES = "oauth_granted_scopes"
 
         @Volatile
         private var instance: AuthManager? = null
@@ -349,7 +375,8 @@ class AuthManager private constructor(private val appContext: Context) {
 private class CompanionWebServer(
     private val authManager: AuthManager,
     private val savedLinksManager: SavedLinksManager,
-    private val driveSettings: DriveSettings
+    private val driveSettings: DriveSettings,
+    private val syncManager: SyncManager
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     @Volatile
@@ -397,7 +424,7 @@ private class CompanionWebServer(
                     val key = line.substring(0, colon).trim().lowercase()
                     val value = line.substring(colon + 1).trim()
                     if (key == "content-length") {
-                        contentLength = value.toIntOrNull()?.coerceIn(0, 262_144) ?: 0
+                        contentLength = value.toIntOrNull()?.coerceIn(0, 2_097_152) ?: 0
                     }
                 }
             }
@@ -405,6 +432,24 @@ private class CompanionWebServer(
             val body = if (contentLength > 0) readFixedBytes(input, contentLength) else ""
 
             when {
+                method == "GET" && path == "/api/sync" -> {
+                    sendJson(s, 200, syncManager.exportLocalStateJson())
+                }
+
+                method == "POST" && path == "/api/sync" -> {
+                    val result = runCatching {
+                        runBlocking { syncManager.receivePeerSyncJson(body) }
+                    }
+                    if (result.isSuccess) {
+                        sendJson(s, 200, result.getOrThrow())
+                    } else {
+                        val errJson = JSONObject()
+                            .put("error", result.exceptionOrNull()?.message ?: "Invalid sync payload")
+                            .toString()
+                        sendJson(s, 400, errJson)
+                    }
+                }
+
                 method == "GET" && path == "/oauth/start" -> {
                     val authUrl = authManager.startNewAuthSession()
                     sendRedirect(s, 302, authUrl)
@@ -415,6 +460,7 @@ private class CompanionWebServer(
                     val codeInput = params["code"].orEmpty()
                     val result = runBlocking { authManager.completeAuthFromInput(codeInput) }
                     if (result.isSuccess) {
+                        syncManager.triggerManualSync()
                         sendRedirect(s, 303, "/?msg=${urlEnc("Signed in to Google Drive on TV!")}")
                     } else {
                         val err = result.exceptionOrNull()?.message ?: "Sign-in failed"
@@ -424,6 +470,7 @@ private class CompanionWebServer(
 
                 method == "POST" && path == "/oauth/signout" -> {
                     authManager.signOut()
+                    syncManager.resetCloudStateOnSignOut()
                     sendRedirect(s, 303, "/?msg=${urlEnc("Signed out.")}")
                 }
 
@@ -434,6 +481,7 @@ private class CompanionWebServer(
                         urlString = params["url"].orEmpty()
                     )
                     if (added != null) {
+                        syncManager.scheduleCloudSyncAfterServerMutation()
                         sendRedirect(s, 303, "/?msg=${urlEnc("Added ${added.title} to Fire TV.")}")
                     } else {
                         sendRedirect(s, 303, "/?err=${urlEnc("Invalid URL.")}")
@@ -448,6 +496,7 @@ private class CompanionWebServer(
                         urlString = params["url"].orEmpty()
                     )
                     if (updated != null) {
+                        syncManager.scheduleCloudSyncAfterServerMutation()
                         sendRedirect(s, 303, "/?msg=${urlEnc("Updated ${updated.title}.")}")
                     } else {
                         sendRedirect(s, 303, "/?err=${urlEnc("Invalid URL or link.")}")
@@ -457,6 +506,7 @@ private class CompanionWebServer(
                 method == "POST" && path == "/links/delete" -> {
                     val params = parseForm(body)
                     savedLinksManager.deleteLink(params["id"].orEmpty())
+                    syncManager.scheduleCloudSyncAfterServerMutation()
                     sendRedirect(s, 303, "/?msg=${urlEnc("Deleted link.")}")
                 }
 
@@ -525,6 +575,20 @@ private class CompanionWebServer(
         socket.getOutputStream().flush()
     }
 
+    private fun sendJson(socket: Socket, status: Int, json: String) {
+        val statusText = when (status) {
+            200 -> "OK"
+            400 -> "Bad Request"
+            else -> "OK"
+        }
+        val bytes = json.toByteArray(StandardCharsets.UTF_8)
+        val headers = "HTTP/1.1 $status $statusText\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: ${bytes.size}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+        val out = socket.getOutputStream()
+        out.write(headers.toByteArray(StandardCharsets.UTF_8))
+        out.write(bytes)
+        out.flush()
+    }
+
     private fun sendHtml(socket: Socket, html: String) {
         val bytes = html.toByteArray(StandardCharsets.UTF_8)
         val headers = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ${bytes.size}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
@@ -536,6 +600,7 @@ private class CompanionWebServer(
 
     private fun buildDashboardHtml(msg: String?, err: String?): String {
         val isAuthed = authManager.isAuthenticated.value
+        val hasAppData = authManager.hasAppDataScope.value
         val links = savedLinksManager.links.value
         val folderId = driveSettings.folderId.value
 
@@ -549,8 +614,19 @@ private class CompanionWebServer(
         }
 
         val authSection = if (isAuthed) {
+            val cloudHint = if (hasAppData) {
+                """<p class="status ok">Google Drive Cloud Sync: Enabled</p>"""
+            } else {
+                """<p class="hint">Cloud Sync (appDataFolder) not granted yet. Click below to re-authorize with Cloud Sync.</p>
+                <a class="btn primary" href="/oauth/start" target="_blank" rel="noopener">Enable Cloud Sync</a>
+                <form method="post" action="/oauth/complete" style="margin-top:10px;margin-bottom:10px">
+                    <input name="code" placeholder="Paste redirect URL or authorization code..." required />
+                    <button type="submit" class="btn primary">Complete Cloud Sync Auth</button>
+                </form>"""
+            }
             """
             <p class="status ok">Google Drive: Signed In</p>
+            $cloudHint
             <form method="post" action="/oauth/signout">
                 <button type="submit" class="btn danger">Sign Out</button>
             </form>

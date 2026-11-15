@@ -10,16 +10,19 @@ final class AuthManager: NSObject, ObservableObject, ASWebAuthenticationPresenta
     static let clientID = "134960325804-ohug3donf2m9l58oj794tah7f0il4arb.apps.googleusercontent.com"
     static let callbackScheme = "com.googleusercontent.apps.134960325804-ohug3donf2m9l58oj794tah7f0il4arb"
     static let redirectURI = "com.googleusercontent.apps.134960325804-ohug3donf2m9l58oj794tah7f0il4arb:/oauthredirect"
-    static let scope = "https://www.googleapis.com/auth/drive.readonly"
+    static let appDataScope = "https://www.googleapis.com/auth/drive.appdata"
+    static let scope = "https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.appdata"
 
     private enum Keys {
         static let accessToken = "oauth_access_token"
         static let refreshToken = "oauth_refresh_token"
         static let expirationDate = "oauth_expiration_date"
+        static let grantedScopes = "oauth_granted_scopes"
     }
 
     @Published private(set) var isAuthenticated = false
     @Published private(set) var isSigningIn = false
+    @Published private(set) var hasAppDataScope: Bool = AuthManager.storedHasAppDataScope()
     @Published var authError: String?
 
     private var activeSession: ASWebAuthenticationSession?
@@ -78,14 +81,26 @@ final class AuthManager: NSObject, ObservableObject, ASWebAuthenticationPresenta
         }
     }
 
+    func enableCloudSync() async {
+        await signIn()
+    }
+
+    func markAppDataScopeRevoked() {
+        UserDefaults.standard.removeObject(forKey: Keys.grantedScopes)
+        hasAppDataScope = false
+    }
+
     func signOut() {
         refreshTask?.cancel()
         refreshTask = nil
         UserDefaults.standard.removeObject(forKey: Keys.accessToken)
         UserDefaults.standard.removeObject(forKey: Keys.refreshToken)
         UserDefaults.standard.removeObject(forKey: Keys.expirationDate)
+        UserDefaults.standard.removeObject(forKey: Keys.grantedScopes)
         isAuthenticated = false
+        hasAppDataScope = false
         authError = nil
+        SyncManager.shared.resetCloudStateOnSignOut()
     }
 
     func validAccessToken() async throws -> String {
@@ -206,6 +221,21 @@ final class AuthManager: NSObject, ObservableObject, ASWebAuthenticationPresenta
         }
         let expiry = Date().addingTimeInterval(TimeInterval(response.expiresIn))
         UserDefaults.standard.set(expiry, forKey: Keys.expirationDate)
+        if let scope = response.scope, !scope.isEmpty {
+            UserDefaults.standard.set(scope, forKey: Keys.grantedScopes)
+            hasAppDataScope = Self.containsAppDataScope(scope)
+        }
+    }
+
+    private static func storedHasAppDataScope() -> Bool {
+        containsAppDataScope(UserDefaults.standard.string(forKey: Keys.grantedScopes))
+    }
+
+    private static func containsAppDataScope(_ scopeString: String?) -> Bool {
+        guard let scopeString else { return false }
+        return scopeString.split(whereSeparator: \.isWhitespace).contains { token in
+            token == appDataScope || token.hasSuffix("/drive.appdata")
+        }
     }
 
     private func generateCodeVerifier() -> String {
@@ -242,11 +272,13 @@ private struct TokenResponse: Decodable {
     let accessToken: String
     let refreshToken: String?
     let expiresIn: Int
+    let scope: String?
 
     enum CodingKeys: String, CodingKey {
         case accessToken = "access_token"
         case refreshToken = "refresh_token"
         case expiresIn = "expires_in"
+        case scope
     }
 }
 

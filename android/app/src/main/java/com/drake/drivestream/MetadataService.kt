@@ -66,6 +66,12 @@ data class CoverSearchResult(
     val summary: String?
 )
 
+data class CustomCoverMatch(
+    val posterUrl: String?,
+    val tvmazeShowId: Int?,
+    val updatedAt: Double? = null
+)
+
 data class PlaybackProgress(
     val fileId: String,
     val position: Double,
@@ -136,6 +142,42 @@ class PlaybackStore private constructor(context: Context) {
         }
     }
 
+    fun applySyncedEntries(merged: Map<String, PlaybackProgress>): Boolean {
+        synchronized(lock) {
+            val current = _progressByFileId.value
+            val updated = current.toMutableMap()
+            val ids = (prefs.getStringSet(KEY_INDEX, emptySet()) ?: emptySet()).toMutableSet()
+            val editor = prefs.edit()
+            var changed = false
+
+            for ((fileId, entry) in merged) {
+                val existing = current[fileId]
+                val sameTime = existing != null &&
+                    kotlin.math.abs(existing.updatedAtMs - entry.updatedAtMs) <= 2L &&
+                    kotlin.math.abs(existing.position - entry.position) <= 0.01 &&
+                    kotlin.math.abs(existing.duration - entry.duration) <= 0.01
+                if (sameTime) continue
+
+                changed = true
+                updated[fileId] = entry
+                ids.add(fileId)
+                val json = JSONObject().apply {
+                    put("fileId", entry.fileId)
+                    put("position", entry.position)
+                    put("duration", entry.duration)
+                    put("updatedAtMs", entry.updatedAtMs)
+                }.toString()
+                editor.putString(KEY_PREFIX + fileId, json)
+            }
+
+            if (changed) {
+                _progressByFileId.value = updated
+                editor.putStringSet(KEY_INDEX, ids).apply()
+            }
+            return changed
+        }
+    }
+
     private fun loadAll() {
         val ids = prefs.getStringSet(KEY_INDEX, emptySet()) ?: emptySet()
         val loaded = linkedMapOf<String, PlaybackProgress>()
@@ -182,7 +224,8 @@ class MetadataService private constructor(context: Context) {
         val name: String,
         val summary: String?,
         val posterUrl: String?,
-        val episodes: Map<String, CachedEpisode>
+        val episodes: Map<String, CachedEpisode>,
+        val updatedAtSec: Double? = null
     )
 
     private val client = OkHttpClient.Builder()
@@ -298,12 +341,14 @@ class MetadataService private constructor(context: Context) {
     suspend fun applyCoverSelection(selection: CoverSearchResult, showTitle: String) {
         val showKey = normalizedShowKey(showTitle)
         if (showKey.isEmpty()) return
+        val nowSec = System.currentTimeMillis() / 1000.0
 
         val resolved: CachedShow? = when (val src = selection.source) {
             is CoverSource.TvMaze -> {
                 val fetched = withContext(Dispatchers.IO) { fetchTvMazeShowById(src.showId) }
                 fetched?.let {
-                    if (it.posterUrl == null) it.copy(posterUrl = selection.posterUrl) else it
+                    val url = if (it.posterUrl == null) selection.posterUrl else it.posterUrl
+                    it.copy(posterUrl = url, updatedAtSec = nowSec)
                 }
             }
 
@@ -319,7 +364,10 @@ class MetadataService private constructor(context: Context) {
                     posterUrl = selection.posterUrl,
                     episodes = emptyMap()
                 )
-                if (selection.posterUrl != null) base.copy(posterUrl = selection.posterUrl) else base
+                base.copy(
+                    posterUrl = selection.posterUrl ?: base.posterUrl,
+                    updatedAtSec = nowSec
+                )
             }
         }
 
@@ -330,6 +378,74 @@ class MetadataService private constructor(context: Context) {
                 saveCacheLocked()
             }
         }
+    }
+
+    fun exportCustomCoversForSync(): Map<String, CustomCoverMatch> {
+        synchronized(cacheLock) {
+            val out = linkedMapOf<String, CustomCoverMatch>()
+            for ((showKey, show) in manualBindings) {
+                out[showKey] = CustomCoverMatch(
+                    posterUrl = show.posterUrl,
+                    tvmazeShowId = show.tvMazeId,
+                    updatedAt = show.updatedAtSec
+                )
+            }
+            return out
+        }
+    }
+
+    suspend fun applyMergedCustomCovers(merged: Map<String, CustomCoverMatch>): Boolean {
+        var changed = false
+        for ((showKey, remote) in merged) {
+            if (showKey.isEmpty()) continue
+            val existing = synchronized(cacheLock) { manualBindings[showKey] }
+            val sameId = existing?.tvMazeId == remote.tvmazeShowId
+            val samePoster = existing?.posterUrl == remote.posterUrl
+            if (existing != null && sameId && samePoster) {
+                if ((existing.updatedAtSec ?: 0.0) < (remote.updatedAt ?: 0.0)) {
+                    val bumped = existing.copy(updatedAtSec = remote.updatedAt)
+                    synchronized(cacheLock) {
+                        manualBindings[showKey] = bumped
+                        showsCache[showKey] = bumped
+                    }
+                }
+                continue
+            }
+
+            var bound: CachedShow? = null
+            if (remote.tvmazeShowId != null) {
+                val fetched = withContext(Dispatchers.IO) { fetchTvMazeShowById(remote.tvmazeShowId) }
+                if (fetched != null) {
+                    bound = fetched.copy(
+                        posterUrl = remote.posterUrl ?: fetched.posterUrl,
+                        updatedAtSec = remote.updatedAt ?: (System.currentTimeMillis() / 1000.0)
+                    )
+                }
+            }
+
+            if (bound == null) {
+                val fallback = existing ?: synchronized(cacheLock) { showsCache[showKey] }
+                bound = CachedShow(
+                    tvMazeId = remote.tvmazeShowId ?: fallback?.tvMazeId,
+                    name = fallback?.name ?: showKey,
+                    summary = fallback?.summary,
+                    posterUrl = remote.posterUrl ?: fallback?.posterUrl,
+                    episodes = fallback?.episodes ?: emptyMap(),
+                    updatedAtSec = remote.updatedAt ?: (System.currentTimeMillis() / 1000.0)
+                )
+            }
+
+            synchronized(cacheLock) {
+                manualBindings[showKey] = bound
+                showsCache[showKey] = bound
+            }
+            changed = true
+        }
+
+        if (changed) {
+            synchronized(cacheLock) { saveCacheLocked() }
+        }
+        return changed
     }
 
     fun clearCache() {
@@ -586,12 +702,18 @@ class MetadataService private constructor(context: Context) {
                     )
                 }
             }
+            val updatedAtSec = if (showObj.has("updatedAt") && !showObj.isNull("updatedAt")) {
+                showObj.optDouble("updatedAt").takeIf { !it.isNaN() }
+            } else {
+                null
+            }
             target[k] = CachedShow(
                 tvMazeId = if (showObj.has("tvMazeId") && !showObj.isNull("tvMazeId")) showObj.optInt("tvMazeId") else null,
                 name = showObj.optNonBlank("name").orEmpty(),
                 summary = showObj.optNonBlank("summary"),
                 posterUrl = showObj.optNonBlank("posterUrl"),
-                episodes = eps
+                episodes = eps,
+                updatedAtSec = updatedAtSec
             )
         }
     }
@@ -628,6 +750,9 @@ class MetadataService private constructor(context: Context) {
                     put("summary", show.summary)
                     put("posterUrl", show.posterUrl)
                     put("episodes", epsObj)
+                    if (show.updatedAtSec != null) {
+                        put("updatedAt", show.updatedAtSec)
+                    }
                 }
             )
         }

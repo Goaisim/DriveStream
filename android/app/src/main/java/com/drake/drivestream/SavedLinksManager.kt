@@ -10,7 +10,7 @@ import org.json.JSONObject
 import java.util.UUID
 
 data class SavedLink(
-    val id: String = UUID.randomUUID().toString(),
+    val id: String = UUID.randomUUID().toString().lowercase(),
     val title: String,
     val urlString: String,
     val dateAdded: Long = System.currentTimeMillis()
@@ -29,6 +29,7 @@ class SavedLinksManager private constructor(context: Context) {
     private val lock = Any()
     private val _links = MutableStateFlow<List<SavedLink>>(emptyList())
     val links: StateFlow<List<SavedLink>> = _links.asStateFlow()
+    private val deletedTombstonesMs = mutableMapOf<String, Long>()
 
     init {
         load()
@@ -43,9 +44,10 @@ class SavedLinksManager private constructor(context: Context) {
             urlString = uri.toString()
         )
         synchronized(lock) {
+            deletedTombstonesMs.remove(newLink.id.lowercase())
             val updated = listOf(newLink) + _links.value
             _links.value = updated
-            persistLocked(updated)
+            persistLocked(updated, deletedTombstonesMs)
         }
         return newLink
     }
@@ -55,27 +57,59 @@ class SavedLinksManager private constructor(context: Context) {
         val uri = validHttpUri(normalized) ?: return null
         val resolvedTitle = resolvedTitle(title, uri)
         var result: SavedLink? = null
+        val now = System.currentTimeMillis()
         synchronized(lock) {
             val updated = _links.value.map { item ->
-                if (item.id == id) {
-                    item.copy(title = resolvedTitle, urlString = uri.toString()).also { result = it }
+                if (item.id.equals(id, ignoreCase = true)) {
+                    item.copy(
+                        title = resolvedTitle,
+                        urlString = uri.toString(),
+                        dateAdded = now
+                    ).also { result = it }
                 } else {
                     item
                 }
             }
             if (result != null) {
+                deletedTombstonesMs.remove(id.lowercase())
                 _links.value = updated
-                persistLocked(updated)
+                persistLocked(updated, deletedTombstonesMs)
             }
         }
         return result
     }
 
     fun deleteLink(id: String) {
+        val key = id.lowercase()
+        val now = System.currentTimeMillis()
         synchronized(lock) {
-            val updated = _links.value.filterNot { it.id == id }
+            val existing = deletedTombstonesMs[key] ?: 0L
+            deletedTombstonesMs[key] = maxOf(existing, now)
+            val updated = _links.value.filterNot { it.id.equals(id, ignoreCase = true) }
             _links.value = updated
-            persistLocked(updated)
+            persistLocked(updated, deletedTombstonesMs)
+        }
+    }
+
+    fun snapshotForSync(): Pair<List<SavedLink>, Map<String, Long>> {
+        synchronized(lock) {
+            return _links.value to deletedTombstonesMs.toMap()
+        }
+    }
+
+    fun applySyncedState(
+        mergedLinks: List<SavedLink>,
+        mergedTombstonesMs: Map<String, Long>
+    ): Boolean {
+        synchronized(lock) {
+            val linksChanged = mergedLinks != _links.value
+            val tombsChanged = mergedTombstonesMs != deletedTombstonesMs
+            if (!linksChanged && !tombsChanged) return false
+            _links.value = mergedLinks
+            deletedTombstonesMs.clear()
+            deletedTombstonesMs.putAll(mergedTombstonesMs)
+            persistLocked(mergedLinks, deletedTombstonesMs)
+            return true
         }
     }
 
@@ -87,28 +121,45 @@ class SavedLinksManager private constructor(context: Context) {
     }
 
     private fun load() {
-        val raw = prefs.getString(STORAGE_KEY, null) ?: return
-        try {
-            val arr = JSONArray(raw)
-            val loaded = buildList {
-                for (i in 0 until arr.length()) {
-                    val obj = arr.optJSONObject(i) ?: continue
-                    val id = obj.optString("id")
-                    val title = obj.optString("title")
-                    val urlString = obj.optString("urlString")
-                    val dateAdded = obj.optLong("dateAdded", System.currentTimeMillis())
-                    if (id.isNotEmpty() && urlString.isNotEmpty()) {
-                        add(SavedLink(id = id, title = title, urlString = urlString, dateAdded = dateAdded))
+        val raw = prefs.getString(STORAGE_KEY, null)
+        if (!raw.isNullOrBlank()) {
+            try {
+                val arr = JSONArray(raw)
+                val loaded = buildList {
+                    for (i in 0 until arr.length()) {
+                        val obj = arr.optJSONObject(i) ?: continue
+                        val id = obj.optString("id")
+                        val title = obj.optString("title")
+                        val urlString = obj.optString("urlString")
+                        val dateAdded = obj.optLong("dateAdded", System.currentTimeMillis())
+                        if (id.isNotEmpty() && urlString.isNotEmpty()) {
+                            add(SavedLink(id = id, title = title, urlString = urlString, dateAdded = dateAdded))
+                        }
+                    }
+                }
+                _links.value = loaded
+            } catch (_: Exception) {
+                _links.value = emptyList()
+            }
+        }
+
+        val rawTomb = prefs.getString(TOMBSTONES_KEY, null)
+        if (!rawTomb.isNullOrBlank()) {
+            runCatching {
+                val tombObj = JSONObject(rawTomb)
+                val keys = tombObj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val v = tombObj.optLong(k, 0L)
+                    if (k.isNotBlank() && v > 0L) {
+                        deletedTombstonesMs[k.lowercase()] = v
                     }
                 }
             }
-            _links.value = loaded
-        } catch (_: Exception) {
-            _links.value = emptyList()
         }
     }
 
-    private fun persistLocked(items: List<SavedLink>) {
+    private fun persistLocked(items: List<SavedLink>, tombstonesMs: Map<String, Long>) {
         val arr = JSONArray()
         items.forEach { link ->
             arr.put(
@@ -120,11 +171,19 @@ class SavedLinksManager private constructor(context: Context) {
                 }
             )
         }
-        prefs.edit().putString(STORAGE_KEY, arr.toString()).apply()
+        val tombObj = JSONObject()
+        for ((k, v) in tombstonesMs) {
+            tombObj.put(k, v)
+        }
+        prefs.edit()
+            .putString(STORAGE_KEY, arr.toString())
+            .putString(TOMBSTONES_KEY, tombObj.toString())
+            .apply()
     }
 
     companion object {
         private const val STORAGE_KEY = "saved_web_links"
+        private const val TOMBSTONES_KEY = "saved_web_link_tombstones"
 
         @Volatile
         private var instance: SavedLinksManager? = null

@@ -74,6 +74,33 @@ final class PlaybackStore: ObservableObject {
         UserDefaults.standard.set(Array(ids), forKey: indexKey)
     }
 
+    @discardableResult
+    func applySyncedEntries(_ merged: [String: PlaybackProgress]) -> Bool {
+        var changed = false
+        let encoder = JSONEncoder()
+        var ids = Set(UserDefaults.standard.stringArray(forKey: indexKey) ?? [])
+
+        for (fileId, entry) in merged {
+            if let existing = progressByFileId[fileId],
+               abs(existing.updatedAt.timeIntervalSince1970 - entry.updatedAt.timeIntervalSince1970) <= 0.002,
+               abs(existing.position - entry.position) <= 0.01,
+               abs(existing.duration - entry.duration) <= 0.01 {
+                continue
+            }
+            changed = true
+            progressByFileId[fileId] = entry
+            ids.insert(fileId)
+            if let data = try? encoder.encode(entry) {
+                UserDefaults.standard.set(data, forKey: keyPrefix + fileId)
+            }
+        }
+
+        if changed {
+            UserDefaults.standard.set(Array(ids), forKey: indexKey)
+        }
+        return changed
+    }
+
     private func loadAll() {
         let ids = UserDefaults.standard.stringArray(forKey: indexKey) ?? []
         var loaded: [String: PlaybackProgress] = [:]
@@ -360,6 +387,7 @@ private final class VLCPlayerViewModel: NSObject, ObservableObject, VLCMediaPlay
         guard !didStop else { return }
         didStop = true
         saveProgress(force: true)
+        SyncManager.shared.scheduleSyncAfterChange()
         player.delegate = nil
         player.stop()
         player.drawable = nil
@@ -432,12 +460,17 @@ private final class VLCPlayerViewModel: NSObject, ObservableObject, VLCMediaPlay
                 self.syncTimeState()
                 self.refreshTracks()
                 self.attemptResumeIfNeeded()
+                if state == .paused {
+                    self.saveProgress(force: true)
+                    SyncManager.shared.scheduleSyncAfterChange()
+                }
             } else if state == .error {
                 self.isLoading = false
                 self.errorMessage = "MobileVLCKit could not open stream (\(LocalStreamProxy.shared.lastStatus))."
             } else if state == .ended {
                 self.isLoading = false
                 self.saveProgress(force: true)
+                SyncManager.shared.scheduleSyncAfterChange()
             }
         }
     }
@@ -1084,6 +1117,7 @@ private struct AVPlayerViewControllerWrapper: UIViewControllerRepresentable {
         private weak var player: AVPlayer?
         private var timeObserverToken: Any?
         private var statusObservation: NSKeyValueObservation?
+        private var timeControlStatusObservation: NSKeyValueObservation?
         private var didSeekToSavedPosition = false
 
         nonisolated init(fileId: String) {
@@ -1113,6 +1147,14 @@ private struct AVPlayerViewControllerWrapper: UIViewControllerRepresentable {
                     self?.persistCurrentTime()
                 }
             }
+
+            timeControlStatusObservation = player.observe(\.timeControlStatus, options: [.new]) { [weak self] observedPlayer, _ in
+                Task { @MainActor in
+                    guard let self, observedPlayer.timeControlStatus == .paused else { return }
+                    self.persistCurrentTime()
+                    SyncManager.shared.scheduleSyncAfterChange()
+                }
+            }
         }
 
         func persistCurrentTime() {
@@ -1128,8 +1170,11 @@ private struct AVPlayerViewControllerWrapper: UIViewControllerRepresentable {
 
         func teardown() {
             persistCurrentTime()
+            SyncManager.shared.scheduleSyncAfterChange()
             statusObservation?.invalidate()
             statusObservation = nil
+            timeControlStatusObservation?.invalidate()
+            timeControlStatusObservation = nil
             if let token = timeObserverToken, let player {
                 player.removeTimeObserver(token)
             }

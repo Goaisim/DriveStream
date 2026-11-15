@@ -107,6 +107,7 @@ fun VlcPlayerScreen(
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
     val proxy = remember(context) { LocalStreamProxy.getInstance(context).also { it.start() } }
     val playbackStore = remember(context) { PlaybackStore.getInstance(context) }
+    val syncManager = remember(context) { SyncManager.getInstance(context) }
 
     val queue = remember(episodes, initialEpisode) {
         episodes.ifEmpty { listOf(initialEpisode) }
@@ -309,6 +310,7 @@ fun VlcPlayerScreen(
                     MediaPlayer.Event.Paused -> {
                         isPlaying = false
                         saveProgress(force = true)
+                        syncManager.scheduleSyncAfterChange()
                     }
 
                     MediaPlayer.Event.Vout, MediaPlayer.Event.ESAdded -> {
@@ -352,6 +354,7 @@ fun VlcPlayerScreen(
                     MediaPlayer.Event.EndReached -> {
                         isPlaying = false
                         saveProgress(force = true)
+                        syncManager.scheduleSyncAfterChange()
                         if (hasNext) {
                             startEpisode(queue[currentIndex + 1])
                         }
@@ -370,6 +373,7 @@ fun VlcPlayerScreen(
 
         onDispose {
             saveProgress(force = true)
+            syncManager.scheduleSyncAfterChange()
             mediaPlayer.setEventListener(null)
             mediaPlayer.stop()
             mediaPlayer.detachViews()

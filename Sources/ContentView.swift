@@ -374,6 +374,7 @@ private struct LibraryHomeView: View {
     @StateObject private var viewModel = LibraryViewModel()
     @ObservedObject private var playbackStore = PlaybackStore.shared
     @ObservedObject private var linksManager = SavedLinksManager.shared
+    @ObservedObject private var syncManager = SyncManager.shared
 
     @AppStorage("drive_folder_id") private var folderID = DriveService.defaultFolderID
 
@@ -497,7 +498,13 @@ private struct LibraryHomeView: View {
                 AdBlockEngine.shared.prepare()
                 guard !hasLoadedOnce else { return }
                 hasLoadedOnce = true
+                Task { await SyncManager.shared.syncOnLaunch() }
                 await reload()
+            }
+            .onChange(of: syncManager.coversRevision) { _, _ in
+                Task {
+                    await viewModel.refreshEnrichedMetadata()
+                }
             }
             .sheet(isPresented: $showSettings) {
                 SettingsView(
@@ -555,6 +562,7 @@ private struct LibraryHomeView: View {
 
                             Button(role: .destructive) {
                                 linksManager.deleteLink(id: link.id)
+                                SyncManager.shared.scheduleSyncAfterChange()
                             } label: {
                                 Label("Delete", systemImage: "trash")
                             }
@@ -697,12 +705,17 @@ private struct LibraryHomeView: View {
 
     @discardableResult
     private func saveLink(mode: LinkEditorMode, title: String, urlString: String) -> SavedLink? {
+        let saved: SavedLink?
         switch mode {
         case .add:
-            return linksManager.addLink(title: title, urlString: urlString)
+            saved = linksManager.addLink(title: title, urlString: urlString)
         case .edit(let existing):
-            return linksManager.updateLink(id: existing.id, title: title, urlString: urlString)
+            saved = linksManager.updateLink(id: existing.id, title: title, urlString: urlString)
         }
+        if saved != nil {
+            SyncManager.shared.scheduleSyncAfterChange()
+        }
+        return saved
     }
 }
 
@@ -1034,6 +1047,7 @@ private struct CoverFinderSheet: View {
                                 Task {
                                     isApplying = true
                                     await TMDBService.shared.applyCoverSelection(result, forShowTitle: rawShowTitle)
+                                    SyncManager.shared.scheduleSyncAfterChange()
                                     await onApplied()
                                     isApplying = false
                                     dismiss()
@@ -1112,12 +1126,14 @@ private struct CoverFinderSheet: View {
 
 private struct SettingsView: View {
     @EnvironmentObject private var authManager: AuthManager
+    @ObservedObject private var syncManager = SyncManager.shared
     @Environment(\.dismiss) private var dismiss
 
     @Binding var folderID: String
     let onSaveOrChange: () -> Void
 
     @State private var draftFolderID = ""
+    @State private var draftPeerHost = ""
     @State private var clearedCache = false
 
     var body: some View {
@@ -1131,6 +1147,70 @@ private struct SettingsView: View {
                     Text("Google Drive")
                 } footer: {
                     Text("Paste the ID from the end of a Drive folder URL (drive.google.com/drive/folders/<ID>), or leave blank to scan all videos in your Drive.")
+                }
+
+                Section {
+                    HStack {
+                        Text("Status")
+                        Spacer()
+                        if syncManager.isSyncing || syncManager.isScanning {
+                            ProgressView()
+                                .padding(.trailing, 6)
+                        }
+                        Text(syncManager.statusMessage)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if authManager.hasAppDataScope {
+                        Label("Google Drive Cloud Sync Enabled", systemImage: "checkmark.icloud.fill")
+                            .foregroundStyle(.green)
+                    } else if authManager.isAuthenticated {
+                        Button {
+                            Task {
+                                await authManager.enableCloudSync()
+                                if authManager.hasAppDataScope {
+                                    await syncManager.syncAll()
+                                }
+                            }
+                        } label: {
+                            Label("Enable Cloud Sync", systemImage: "icloud.and.arrow.up")
+                        }
+                    }
+
+                    TextField("Fire TV IP (e.g. 192.168.1.42)", text: $draftPeerHost)
+                        .keyboardType(.numbersAndPunctuation)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+
+                    Button {
+                        syncManager.peerHost = draftPeerHost
+                        Task {
+                            if let found = await syncManager.scanLocalNetworkForFireTV() {
+                                draftPeerHost = found
+                            }
+                        }
+                    } label: {
+                        Label(
+                            syncManager.isScanning ? "Scanning Home Wi-Fi…" : "Scan Wi-Fi for Fire TV",
+                            systemImage: "wifi.circle"
+                        )
+                    }
+                    .disabled(syncManager.isScanning)
+
+                    Button {
+                        syncManager.peerHost = draftPeerHost
+                        Task {
+                            await syncManager.syncAll(discoverIfMissing: false)
+                        }
+                    } label: {
+                        Label("Sync Now", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    .disabled(syncManager.isSyncing || syncManager.isScanning)
+                } header: {
+                    Text("Cross-Device Sync (iOS ↔ Fire TV)")
+                } footer: {
+                    Text("Syncs Web Links, Watch Progress, and Matched Covers over Home Wi-Fi (:8766) with zero re-login, plus Google Drive appDataFolder when authorized.")
                 }
 
                 Section {
@@ -1167,6 +1247,7 @@ private struct SettingsView: View {
                     Button("Save") {
                         let trimmedFolder = draftFolderID.trimmingCharacters(in: .whitespacesAndNewlines)
                         let changed = trimmedFolder != folderID || clearedCache
+                        syncManager.peerHost = draftPeerHost
                         folderID = trimmedFolder
                         dismiss()
                         if changed {
@@ -1177,6 +1258,7 @@ private struct SettingsView: View {
             }
             .onAppear {
                 draftFolderID = folderID
+                draftPeerHost = syncManager.peerHost
             }
         }
     }

@@ -4,7 +4,7 @@ struct SavedLink: Codable, Identifiable, Equatable {
     let id: UUID
     var title: String
     var urlString: String
-    let dateAdded: Date
+    var dateAdded: Date
 
     init(
         id: UUID = UUID(),
@@ -35,8 +35,10 @@ final class SavedLinksManager: ObservableObject {
     static let shared = SavedLinksManager()
 
     @Published private(set) var links: [SavedLink] = []
+    private(set) var deletedTombstones: [String: TimeInterval] = [:]
 
     private let storageKey = "saved_web_links"
+    private let tombstonesKey = "saved_web_link_tombstones"
 
     private init() {
         load()
@@ -74,6 +76,7 @@ final class SavedLinksManager: ObservableObject {
         guard let url = Self.validURL(from: urlString) else { return nil }
         let resolvedTitle = resolvedTitle(title, fallbackURL: url)
         let link = SavedLink(title: resolvedTitle, urlString: url.absoluteString)
+        deletedTombstones.removeValue(forKey: link.id.uuidString.lowercased())
         links.insert(link, at: 0)
         save()
         return link
@@ -87,20 +90,39 @@ final class SavedLinksManager: ObservableObject {
         }
         links[index].title = resolvedTitle(title, fallbackURL: url)
         links[index].urlString = url.absoluteString
+        links[index].dateAdded = Date()
+        deletedTombstones.removeValue(forKey: id.uuidString.lowercased())
         save()
         return links[index]
     }
 
     func deleteLink(id: UUID) {
+        let now = Date().timeIntervalSince1970
+        let key = id.uuidString.lowercased()
+        deletedTombstones[key] = max(deletedTombstones[key] ?? 0, now)
         links.removeAll { $0.id == id }
         save()
     }
 
     func deleteLinks(at offsets: IndexSet) {
+        let now = Date().timeIntervalSince1970
         for index in offsets.sorted(by: >) where links.indices.contains(index) {
+            let key = links[index].id.uuidString.lowercased()
+            deletedTombstones[key] = max(deletedTombstones[key] ?? 0, now)
             links.remove(at: index)
         }
         save()
+    }
+
+    @discardableResult
+    func applySyncedState(links newLinks: [SavedLink], deletedTombstones newTombstones: [String: TimeInterval]) -> Bool {
+        let linksChanged = newLinks != links
+        let tombstonesChanged = newTombstones != deletedTombstones
+        guard linksChanged || tombstonesChanged else { return false }
+        links = newLinks
+        deletedTombstones = newTombstones
+        save()
+        return true
     }
 
     private func resolvedTitle(_ rawTitle: String, fallbackURL: URL) -> String {
@@ -113,16 +135,27 @@ final class SavedLinksManager: ObservableObject {
     }
 
     private func load() {
-        guard let data = UserDefaults.standard.data(forKey: storageKey),
-              let decoded = try? JSONDecoder().decode([SavedLink].self, from: data) else {
+        if let data = UserDefaults.standard.data(forKey: storageKey),
+           let decoded = try? JSONDecoder().decode([SavedLink].self, from: data) {
+            links = decoded
+        } else {
             links = []
-            return
         }
-        links = decoded
+
+        if let tombData = UserDefaults.standard.data(forKey: tombstonesKey),
+           let decodedTomb = try? JSONDecoder().decode([String: TimeInterval].self, from: tombData) {
+            deletedTombstones = decodedTomb
+        } else {
+            deletedTombstones = [:]
+        }
     }
 
     private func save() {
-        guard let data = try? JSONEncoder().encode(links) else { return }
-        UserDefaults.standard.set(data, forKey: storageKey)
+        if let data = try? JSONEncoder().encode(links) {
+            UserDefaults.standard.set(data, forKey: storageKey)
+        }
+        if let tombData = try? JSONEncoder().encode(deletedTombstones) {
+            UserDefaults.standard.set(tombData, forKey: tombstonesKey)
+        }
     }
 }

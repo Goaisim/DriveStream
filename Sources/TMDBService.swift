@@ -46,6 +46,18 @@ struct CoverSearchResult: Identifiable, Hashable {
     let summary: String?
 }
 
+struct CustomCoverMatch: Codable, Equatable {
+    let posterUrl: String?
+    let tvmazeShowId: Int?
+    let updatedAt: Double?
+
+    init(posterUrl: String?, tvmazeShowId: Int?, updatedAt: Double? = nil) {
+        self.posterUrl = posterUrl
+        self.tvmazeShowId = tvmazeShowId
+        self.updatedAt = updatedAt
+    }
+}
+
 @MainActor
 final class TMDBService {
     static let shared = TMDBService()
@@ -62,6 +74,7 @@ final class TMDBService {
         var summary: String?
         var posterURL: URL?
         var episodes: [String: CachedEpisode]
+        var updatedAt: Double? = nil
     }
 
     private struct CacheStore: Codable {
@@ -210,6 +223,7 @@ final class TMDBService {
     func applyCoverSelection(_ selection: CoverSearchResult, forShowTitle showTitle: String) async {
         let showKey = normalizedShowKey(showTitle)
         guard !showKey.isEmpty else { return }
+        let now = Date().timeIntervalSince1970
 
         switch selection.source {
         case .tvMaze(let showId):
@@ -218,6 +232,7 @@ final class TMDBService {
                 if updated.posterURL == nil {
                     updated.posterURL = selection.posterURL
                 }
+                updated.updatedAt = now
                 cache.manualBindings[showKey] = updated
                 cache.shows[showKey] = updated
                 saveCache()
@@ -238,10 +253,79 @@ final class TMDBService {
             if let poster = selection.posterURL {
                 bound.posterURL = poster
             }
+            bound.updatedAt = now
             cache.manualBindings[showKey] = bound
             cache.shows[showKey] = bound
             saveCache()
         }
+    }
+
+    func exportCustomCoversForSync() -> [String: CustomCoverMatch] {
+        var result: [String: CustomCoverMatch] = [:]
+        for (showKey, show) in cache.manualBindings {
+            result[showKey] = CustomCoverMatch(
+                posterUrl: show.posterURL?.absoluteString,
+                tvmazeShowId: show.tvMazeId,
+                updatedAt: show.updatedAt
+            )
+        }
+        return result
+    }
+
+    @discardableResult
+    func applyMergedCustomCovers(_ merged: [String: CustomCoverMatch]) async -> Bool {
+        var changed = false
+        for (showKey, remote) in merged {
+            guard !showKey.isEmpty else { continue }
+            let existing = cache.manualBindings[showKey]
+            let sameId = existing?.tvMazeId == remote.tvmazeShowId
+            let samePoster = existing?.posterURL?.absoluteString == remote.posterUrl
+            if existing != nil && sameId && samePoster {
+                if (existing?.updatedAt ?? 0) < (remote.updatedAt ?? 0) {
+                    var bumped = existing!
+                    bumped.updatedAt = remote.updatedAt
+                    cache.manualBindings[showKey] = bumped
+                    cache.shows[showKey] = bumped
+                }
+                continue
+            }
+
+            let resolvedURL = remote.posterUrl.flatMap { URL(string: $0) }
+            var bound: CachedShow?
+
+            if let showId = remote.tvmazeShowId {
+                if var fetched = await fetchTVMazeShowById(showId) {
+                    if let resolvedURL, fetched.posterURL == nil || resolvedURL != fetched.posterURL {
+                        fetched.posterURL = resolvedURL
+                    }
+                    fetched.updatedAt = remote.updatedAt ?? Date().timeIntervalSince1970
+                    bound = fetched
+                }
+            }
+
+            if bound == nil {
+                let fallback = existing ?? cache.shows[showKey]
+                bound = CachedShow(
+                    tvMazeId: remote.tvmazeShowId ?? fallback?.tvMazeId,
+                    name: fallback?.name ?? showKey.capitalized,
+                    summary: fallback?.summary,
+                    posterURL: resolvedURL ?? fallback?.posterURL,
+                    episodes: fallback?.episodes ?? [:],
+                    updatedAt: remote.updatedAt ?? Date().timeIntervalSince1970
+                )
+            }
+
+            if let bound {
+                cache.manualBindings[showKey] = bound
+                cache.shows[showKey] = bound
+                changed = true
+            }
+        }
+
+        if changed {
+            saveCache()
+        }
+        return changed
     }
 
     func clearCache() {

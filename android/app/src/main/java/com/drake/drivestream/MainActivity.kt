@@ -18,6 +18,7 @@ class MainActivity : ComponentActivity() {
         AuthManager.getInstance(this).startCompanionServer()
         LocalStreamProxy.getInstance(this).start()
         AndroidAdBlockEngine.getInstance(this).prepare()
+        SyncManager.getInstance(this).syncOnLaunch()
 
         handleOAuthIntent(intent)
 
@@ -47,7 +48,10 @@ class MainActivity : ComponentActivity() {
         val data = intent?.data ?: return
         if (data.scheme == AuthManager.REDIRECT_SCHEME) {
             lifecycleScope.launch {
-                AuthManager.getInstance(this@MainActivity).handleRedirectUri(data)
+                val res = AuthManager.getInstance(this@MainActivity).handleRedirectUri(data)
+                if (res.isSuccess) {
+                    SyncManager.getInstance(this@MainActivity).triggerManualSync()
+                }
             }
         }
     }

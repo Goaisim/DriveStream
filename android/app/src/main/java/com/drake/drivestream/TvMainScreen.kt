@@ -26,11 +26,13 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AddCircle
@@ -293,11 +295,14 @@ fun TvMainScreen(libraryViewModel: LibraryViewModel = viewModel()) {
     val driveSettings = remember(context) { DriveSettings.getInstance(context) }
     val playbackStore = remember(context) { PlaybackStore.getInstance(context) }
     val metadataService = remember(context) { MetadataService.getInstance(context) }
+    val syncManager = remember(context) { SyncManager.getInstance(context) }
 
     val isAuthenticated by authManager.isAuthenticated.collectAsState()
+    val hasAppDataScope by authManager.hasAppDataScope.collectAsState()
     val companionUrl by authManager.companionUrl.collectAsState()
     val savedLinks by linksManager.links.collectAsState()
     val folderId by driveSettings.folderId.collectAsState()
+    val coversRevision by syncManager.coversRevision.collectAsState()
 
     var bypassSignIn by remember { mutableStateOf(false) }
     var activeWebLink by remember { mutableStateOf<SavedLink?>(null) }
@@ -313,7 +318,14 @@ fun TvMainScreen(libraryViewModel: LibraryViewModel = viewModel()) {
     LaunchedEffect(isAuthenticated, folderId) {
         if (isAuthenticated) {
             bypassSignIn = false
+            syncManager.triggerManualSync()
             libraryViewModel.loadLibrary(folderId)
+        }
+    }
+
+    LaunchedEffect(coversRevision) {
+        if (coversRevision > 0 && isAuthenticated) {
+            libraryViewModel.refreshEnrichedMetadata()
         }
     }
 
@@ -419,10 +431,13 @@ fun TvMainScreen(libraryViewModel: LibraryViewModel = viewModel()) {
                 },
                 onSave = { title, url ->
                     val existing = editingLink
-                    if (existing == null) {
+                    val saved = if (existing == null) {
                         linksManager.addLink(title, url)
                     } else {
                         linksManager.updateLink(existing.id, title, url)
+                    }
+                    if (saved != null) {
+                        syncManager.scheduleSyncAfterChange()
                     }
                     showAddEditDialog = false
                     editingLink = null
@@ -437,6 +452,7 @@ fun TvMainScreen(libraryViewModel: LibraryViewModel = viewModel()) {
                     showAddEditDialog = false
                     editingLink = null
                     if (saved != null) {
+                        syncManager.scheduleSyncAfterChange()
                         activeWebLink = saved
                     }
                 }
@@ -459,6 +475,7 @@ fun TvMainScreen(libraryViewModel: LibraryViewModel = viewModel()) {
                 onDelete = {
                     actionMenuLink = null
                     linksManager.deleteLink(targetLink.id)
+                    syncManager.scheduleSyncAfterChange()
                 }
             )
         }
@@ -471,6 +488,7 @@ fun TvMainScreen(libraryViewModel: LibraryViewModel = viewModel()) {
                 onDismiss = { coverFinderTarget = null },
                 onApplied = {
                     coverFinderTarget = null
+                    syncManager.scheduleSyncAfterChange()
                     libraryViewModel.refreshEnrichedMetadata()
                 }
             )
@@ -479,8 +497,10 @@ fun TvMainScreen(libraryViewModel: LibraryViewModel = viewModel()) {
         if (showSettingsDialog) {
             TvSettingsDialog(
                 isAuthenticated = isAuthenticated,
+                hasAppDataScope = hasAppDataScope,
                 companionUrl = companionUrl,
                 currentFolderId = folderId,
+                syncManager = syncManager,
                 onDismiss = { showSettingsDialog = false },
                 onSaveFolderId = { newId ->
                     val changed = newId.trim() != folderId
@@ -489,6 +509,10 @@ fun TvMainScreen(libraryViewModel: LibraryViewModel = viewModel()) {
                     if (changed && isAuthenticated) {
                         libraryViewModel.loadLibrary(newId.trim())
                     }
+                },
+                onEnableCloudSync = {
+                    showSettingsDialog = false
+                    authManager.launchTvBrowserSignIn(context)
                 },
                 onClearMetadataCache = {
                     metadataService.clearCache()
@@ -1587,29 +1611,91 @@ private fun CoverFinderTvDialog(
 @Composable
 private fun TvSettingsDialog(
     isAuthenticated: Boolean,
+    hasAppDataScope: Boolean,
     companionUrl: String,
     currentFolderId: String,
+    syncManager: SyncManager,
     onDismiss: () -> Unit,
     onSaveFolderId: (String) -> Unit,
+    onEnableCloudSync: () -> Unit,
     onClearMetadataCache: () -> Unit,
     onSignOutOrSignIn: () -> Unit
 ) {
+    val savedPeerHost by syncManager.peerHost.collectAsState()
+    val isSyncing by syncManager.isSyncing.collectAsState()
+    val isScanning by syncManager.isScanning.collectAsState()
+    val syncStatus by syncManager.statusMessage.collectAsState()
+
     var draftFolderId by remember(currentFolderId) { mutableStateOf(currentFolderId) }
+    var draftPeerHost by remember(savedPeerHost) { mutableStateOf(savedPeerHost) }
     var cacheCleared by remember { mutableStateOf(false) }
 
     BackHandler { onDismiss() }
 
     TvDialogSurface(
         title = "Settings",
+        maxHeightFraction = 0.88f,
         onDismiss = onDismiss
     ) {
-        Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        Column(
+            modifier = Modifier.verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
             Text(
-                text = "Companion Web Server: $companionUrl",
+                text = "Companion & LAN Peer Server: $companionUrl",
                 color = Color(0xFF93C5FD),
                 fontSize = 13.sp,
                 fontWeight = FontWeight.SemiBold
             )
+
+            Text(
+                text = "Sync Status: $syncStatus" + when {
+                    isScanning -> " (scanning…)"
+                    isSyncing -> " (syncing…)"
+                    hasAppDataScope -> " • Drive Cloud Enabled"
+                    isAuthenticated -> " • Drive Cloud Re-Consent Needed"
+                    else -> ""
+                },
+                color = if (hasAppDataScope) Color(0xFF4ADE80) else Color(0xFFD1D5DB),
+                fontSize = 12.sp
+            )
+
+            if (isAuthenticated && !hasAppDataScope) {
+                TvActionButton(
+                    label = "Enable Cloud Sync (Google Drive)",
+                    isPrimary = true,
+                    onClick = onEnableCloudSync
+                )
+            }
+
+            TvTextInput(
+                label = "Optional Peer TV LAN IP (iOS auto-discovers this TV on :8766)",
+                value = draftPeerHost,
+                onValueChange = { draftPeerHost = it },
+                onSubmit = {
+                    syncManager.setPeerHost(draftPeerHost)
+                    syncManager.triggerManualSync()
+                }
+            )
+
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                TvActionButton(
+                    label = if (isSyncing) "Syncing…" else "Sync Now",
+                    isPrimary = true,
+                    enabled = !isSyncing && !isScanning,
+                    onClick = {
+                        syncManager.setPeerHost(draftPeerHost)
+                        syncManager.triggerManualSync()
+                    }
+                )
+                TvActionButton(
+                    label = if (isScanning) "Scanning…" else "Scan Wi-Fi",
+                    enabled = !isScanning,
+                    onClick = {
+                        syncManager.scanLocalNetworkForPeer()
+                    }
+                )
+            }
 
             TvTextInput(
                 label = "Google Drive Folder ID (blank = all videos)",
@@ -1621,7 +1707,10 @@ private fun TvSettingsDialog(
                 TvActionButton(
                     label = "Save Folder ID",
                     isPrimary = true,
-                    onClick = { onSaveFolderId(draftFolderId) }
+                    onClick = {
+                        syncManager.setPeerHost(draftPeerHost)
+                        onSaveFolderId(draftFolderId)
+                    }
                 )
                 TvActionButton(
                     label = if (cacheCleared) "Cache Cleared" else "Clear Show Cache",
