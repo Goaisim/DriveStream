@@ -93,6 +93,8 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -284,15 +286,44 @@ class AndroidAdBlockEngine private constructor(private val appContext: Context) 
     }
 }
 
-private const val DESKTOP_CHROME_UA =
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+private const val FIRE_TV_CHROME_UA =
+    "Mozilla/5.0 (Linux; Android 11; AFTKRT) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
 
 private data class DetectedHlsStream(
     val m3u8Url: String,
     val referer: String,
     val origin: String,
-    val userAgent: String
+    val userAgent: String,
+    val cookie: String = "",
+    val extraHeaders: Map<String, String> = emptyMap()
 )
+
+private val IGNORED_FORWARD_HEADERS = setOf(
+    "host", "cookie", "referer", "origin", "user-agent",
+    "connection", "content-length", "accept-encoding"
+)
+
+private fun filterExtraHeaders(raw: Map<String, String>?): Map<String, String> {
+    if (raw.isNullOrEmpty()) return emptyMap()
+    val out = LinkedHashMap<String, String>()
+    for ((k, v) in raw) {
+        val lower = k.lowercase(Locale.US)
+        if (lower in IGNORED_FORWARD_HEADERS || lower.startsWith("sec-")) continue
+        if (k.isNotBlank() && v.isNotBlank()) {
+            out[k] = v
+        }
+    }
+    return out
+}
+
+private fun deriveOrigin(referer: String): String {
+    val refUri = runCatching { Uri.parse(referer) }.getOrNull() ?: return ""
+    val refScheme = refUri.scheme
+    val refHost = refUri.host
+    if (refScheme.isNullOrBlank() || refHost.isNullOrBlank()) return ""
+    val portSuffix = if (refUri.port > 0) ":${refUri.port}" else ""
+    return "$refScheme://$refHost$portSuffix"
+}
 
 private fun looksLikeMasterPlaylist(url: String): Boolean {
     val lower = url.lowercase(Locale.US)
@@ -330,7 +361,7 @@ private class AdBlockJsBridge(
                     m3u8Url = m3u8Url,
                     referer = obj.optString("referer", ""),
                     origin = obj.optString("origin", ""),
-                    userAgent = obj.optString("userAgent", DESKTOP_CHROME_UA)
+                    userAgent = obj.optString("userAgent", FIRE_TV_CHROME_UA)
                 )
             )
         }
@@ -369,7 +400,7 @@ fun AdBlockWebViewScreen(
     var customVideoCallback by remember { mutableStateOf<WebChromeClient.CustomViewCallback?>(null) }
 
     var detectedStream by remember { mutableStateOf<DetectedHlsStream?>(null) }
-    var nativePlayerEpisode by remember { mutableStateOf<PlayerEpisode?>(null) }
+    var nativeStreamSpec by remember { mutableStateOf<NativeHlsStreamSpec?>(null) }
 
     val latestMainFrameUrlRef = remember { AtomicReference(initialUrl) }
 
@@ -391,9 +422,18 @@ fun AdBlockWebViewScreen(
             return
         }
         if (existing.m3u8Url == candidate.m3u8Url) {
-            if (existing.referer.isBlank() && candidate.referer.isNotBlank()) {
-                detectedStream = candidate
-            }
+            val mergedCookies = mergeCookieHeaders(existing.cookie, candidate.cookie)
+            val bestReferer = candidate.referer.takeIf { it.isNotBlank() } ?: existing.referer
+            val bestOrigin = candidate.origin.takeIf { it.isNotBlank() } ?: existing.origin
+            val bestUa = candidate.userAgent.takeIf { it.isNotBlank() } ?: existing.userAgent
+            val bestExtra = if (candidate.extraHeaders.isNotEmpty()) candidate.extraHeaders else existing.extraHeaders
+            detectedStream = existing.copy(
+                referer = bestReferer,
+                origin = bestOrigin,
+                userAgent = bestUa,
+                cookie = mergedCookies,
+                extraHeaders = bestExtra
+            )
             return
         }
         val existingUri = runCatching { Uri.parse(existing.m3u8Url) }.getOrNull()
@@ -424,11 +464,14 @@ fun AdBlockWebViewScreen(
     var toolbarToggleTick by remember { mutableIntStateOf(0) }
 
     val toolbarFocusRequester = remember { FocusRequester() }
+    val nativePlayerFocusRequester = remember { FocusRequester() }
     val webCursorFocusRequester = remember { FocusRequester() }
 
     val webView = remember(context) {
         WebView(context).apply {
             setBackgroundColor(AndroidColor.rgb(10, 10, 15))
+            setLayerType(View.LAYER_TYPE_HARDWARE, null)
+            keepScreenOn = true
             isFocusable = false
             isFocusableInTouchMode = false
             settings.apply {
@@ -442,7 +485,7 @@ fun AdBlockWebViewScreen(
                 useWideViewPort = true
                 loadWithOverviewMode = true
                 mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                userAgentString = DESKTOP_CHROME_UA
+                userAgentString = FIRE_TV_CHROME_UA
             }
 
             CookieManager.getInstance().setAcceptCookie(true)
@@ -458,6 +501,12 @@ fun AdBlockWebViewScreen(
                 "AdBlockBridge"
             )
 
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                runCatching {
+                    WebViewCompat.addDocumentStartJavaScript(this, AD_BLOCK_JS, setOf("*"))
+                }
+            }
+
             webViewClient = object : WebViewClient() {
                 override fun shouldInterceptRequest(
                     view: WebView?,
@@ -469,34 +518,31 @@ fun AdBlockWebViewScreen(
                         return null
                     }
 
-                    val pathLower = uri.encodedPath?.lowercase(Locale.US).orEmpty()
-                    val queryLower = uri.encodedQuery?.lowercase(Locale.US).orEmpty()
-                    if (pathLower.contains(".m3u8") || queryLower.contains(".m3u8")) {
+                    val urlStr = uri.toString()
+                    if (urlStr.lowercase(Locale.US).contains(".m3u8") && !engine.isBlockedHost(uri.host)) {
                         val reqHeaders = request.requestHeaders ?: emptyMap()
                         val referer = reqHeaders["Referer"]
                             ?: reqHeaders["referer"]
                             ?: latestMainFrameUrlRef.get()
                         val origin = reqHeaders["Origin"]
                             ?: reqHeaders["origin"]
-                            ?: run {
-                                val refUri = runCatching { Uri.parse(referer) }.getOrNull()
-                                val refScheme = refUri?.scheme
-                                val refHost = refUri?.host
-                                if (refUri != null && !refScheme.isNullOrBlank() && !refHost.isNullOrBlank()) {
-                                    val portSuffix = if (refUri.port > 0) ":${refUri.port}" else ""
-                                    "$refScheme://$refHost$portSuffix"
-                                } else {
-                                    ""
-                                }
-                            }
+                            ?: deriveOrigin(referer)
                         val ua = reqHeaders["User-Agent"]
                             ?: reqHeaders["user-agent"]
-                            ?: DESKTOP_CHROME_UA
+                            ?: FIRE_TV_CHROME_UA
+                        val reqCookie = reqHeaders["Cookie"] ?: reqHeaders["cookie"]
+                        val targetCookie = runCatching { CookieManager.getInstance().getCookie(urlStr) }.getOrNull()
+                        val refCookie = referer.takeIf { it.isNotBlank() }?.let { ref ->
+                            runCatching { CookieManager.getInstance().getCookie(ref) }.getOrNull()
+                        }
+                        val mergedCookie = mergeCookieHeaders(reqCookie, refCookie, targetCookie)
                         val detected = DetectedHlsStream(
-                            m3u8Url = uri.toString(),
+                            m3u8Url = urlStr,
                             referer = referer,
                             origin = origin,
-                            userAgent = ua
+                            userAgent = ua,
+                            cookie = mergedCookie,
+                            extraHeaders = filterExtraHeaders(reqHeaders)
                         )
                         mainHandler.post { updateDetectedStream(detected) }
                         return null
@@ -683,6 +729,40 @@ fun AdBlockWebViewScreen(
         toolbarToggleTick += 1
     }
 
+    fun openNativePlayer(stream: DetectedHlsStream) {
+        webView.evaluateJavascript(
+            "document.querySelectorAll('video, audio').forEach(function(e){try{e.pause();}catch(_){}});",
+            null
+        )
+        webView.onPause()
+        val hostLabel = runCatching { Uri.parse(currentUrl).host }
+            .getOrNull()
+            ?.removePrefix("www.")
+            ?.takeIf { it.isNotBlank() }
+            ?: "Live Stream"
+        val titleLabel = webView.title?.trim()?.takeIf { it.isNotBlank() }
+            ?: hostLabel
+        val liveTargetCookie = runCatching { CookieManager.getInstance().getCookie(stream.m3u8Url) }.getOrNull()
+        val liveRefCookie = stream.referer.takeIf { it.isNotBlank() }?.let { ref ->
+            runCatching { CookieManager.getInstance().getCookie(ref) }.getOrNull()
+        }
+        nativeStreamSpec = NativeHlsStreamSpec(
+            m3u8Url = stream.m3u8Url,
+            title = titleLabel,
+            subtitle = hostLabel,
+            referer = stream.referer,
+            origin = stream.origin,
+            userAgent = stream.userAgent.ifBlank { FIRE_TV_CHROME_UA },
+            cookie = mergeCookieHeaders(stream.cookie, liveRefCookie, liveTargetCookie),
+            extraHeaders = stream.extraHeaders
+        )
+    }
+
+    fun closeNativePlayer() {
+        nativeStreamSpec = null
+        webView.onResume()
+    }
+
     fun dispatchVirtualTapAtCursor() {
         clickPulseActive = true
         val downTime = SystemClock.uptimeMillis()
@@ -703,14 +783,24 @@ fun AdBlockWebViewScreen(
         if (toolbarToggleTick == 0) return@LaunchedEffect
         if (isToolbarVisible) {
             delay(60L)
-            runCatching { toolbarFocusRequester.requestFocus() }
+            if (detectedStream != null) {
+                runCatching { nativePlayerFocusRequester.requestFocus() }
+            } else {
+                runCatching { toolbarFocusRequester.requestFocus() }
+            }
         } else {
             runCatching { webCursorFocusRequester.requestFocus() }
         }
     }
 
-    LaunchedEffect(nativePlayerEpisode) {
-        if (nativePlayerEpisode == null) {
+    LaunchedEffect(detectedStream != null) {
+        if (detectedStream != null && nativeStreamSpec == null) {
+            isToolbarVisible = true
+        }
+    }
+
+    LaunchedEffect(nativeStreamSpec) {
+        if (nativeStreamSpec == null) {
             delay(50L)
             runCatching { webCursorFocusRequester.requestFocus() }
         }
@@ -722,6 +812,7 @@ fun AdBlockWebViewScreen(
             customVideoCallback?.onCustomViewHidden()
             customVideoCallback = null
             customVideoView = null
+            webView.onResume()
             webView.stopLoading()
             webView.removeJavascriptInterface("AdBlockBridge")
             webView.loadUrl("about:blank")
@@ -729,7 +820,7 @@ fun AdBlockWebViewScreen(
         }
     }
 
-    BackHandler(enabled = nativePlayerEpisode == null) {
+    BackHandler(enabled = nativeStreamSpec == null) {
         if (customVideoView != null) {
             customVideoCallback?.onCustomViewHidden()
             customVideoCallback = null
@@ -770,17 +861,27 @@ fun AdBlockWebViewScreen(
             .fillMaxSize()
             .background(Color(0xFF0A0A0F))
             .onPreviewKeyEvent { keyEvent ->
-                if (nativePlayerEpisode != null) return@onPreviewKeyEvent false
+                if (nativeStreamSpec != null) return@onPreviewKeyEvent false
                 val native = keyEvent.nativeKeyEvent
-                if (keyEvent.type == KeyEventType.KeyDown && native.keyCode == KeyEvent.KEYCODE_MENU) {
-                    toggleToolbar()
-                    return@onPreviewKeyEvent true
+                if (keyEvent.type == KeyEventType.KeyDown) {
+                    if (native.keyCode == KeyEvent.KEYCODE_MENU) {
+                        toggleToolbar()
+                        return@onPreviewKeyEvent true
+                    }
+                    val stream = detectedStream
+                    if (stream != null && customVideoView == null &&
+                        (native.keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE ||
+                            native.keyCode == KeyEvent.KEYCODE_MEDIA_PLAY)
+                    ) {
+                        openNativePlayer(stream)
+                        return@onPreviewKeyEvent true
+                    }
                 }
                 false
             }
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
-            AnimatedVisibility(visible = isToolbarVisible && customVideoView == null && nativePlayerEpisode == null) {
+            AnimatedVisibility(visible = isToolbarVisible && customVideoView == null && nativeStreamSpec == null) {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -877,6 +978,7 @@ fun AdBlockWebViewScreen(
                             var nativeBtnFocused by remember { mutableStateOf(false) }
                             Row(
                                 modifier = Modifier
+                                    .focusRequester(nativePlayerFocusRequester)
                                     .height(42.dp)
                                     .clip(RoundedCornerShape(21.dp))
                                     .background(
@@ -891,44 +993,19 @@ fun AdBlockWebViewScreen(
                                     )
                                     .onFocusChanged { nativeBtnFocused = it.isFocused }
                                     .focusable()
-                                    .clickable {
-                                        webView.evaluateJavascript(
-                                            "document.querySelectorAll('video').forEach(function(v){try{v.pause();}catch(e){}});",
-                                            null
-                                        )
-                                        val hostLabel = runCatching { Uri.parse(currentUrl).host }
-                                            .getOrNull()
-                                            ?.removePrefix("www.")
-                                            ?.takeIf { it.isNotBlank() }
-                                            ?: "Live Stream"
-                                        val titleLabel = webView.title?.trim()?.takeIf { it.isNotBlank() }
-                                            ?: hostLabel
-                                        nativePlayerEpisode = PlayerEpisode(
-                                            id = "web-live-${activeStream.m3u8Url.hashCode()}",
-                                            title = titleLabel,
-                                            shortTitle = "Live Stream",
-                                            subtitle = hostLabel,
-                                            episodeCode = "LIVE",
-                                            stillUrl = null,
-                                            streamUrl = activeStream.m3u8Url,
-                                            referer = activeStream.referer,
-                                            origin = activeStream.origin,
-                                            userAgent = activeStream.userAgent,
-                                            isLiveStream = true
-                                        )
-                                    }
+                                    .clickable { openNativePlayer(activeStream) }
                                     .padding(horizontal = 14.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
                                 Icon(
                                     imageVector = Icons.Default.Bolt,
-                                    contentDescription = "Native Player",
+                                    contentDescription = "Native Player (60fps HLS)",
                                     tint = Color.White,
                                     modifier = Modifier.size(16.dp)
                                 )
                                 Text(
-                                    text = "Native Player",
+                                    text = "Native Player (60fps HLS)",
                                     color = Color.White,
                                     fontSize = 12.sp,
                                     fontWeight = FontWeight.Bold
@@ -1047,9 +1124,9 @@ fun AdBlockWebViewScreen(
                         }
                     }
                     .focusRequester(webCursorFocusRequester)
-                    .focusable(enabled = customVideoView == null && nativePlayerEpisode == null)
+                    .focusable(enabled = customVideoView == null && nativeStreamSpec == null)
                     .onPreviewKeyEvent { keyEvent ->
-                        if (customVideoView != null || nativePlayerEpisode != null) return@onPreviewKeyEvent false
+                        if (customVideoView != null || nativeStreamSpec != null) return@onPreviewKeyEvent false
                         if (keyEvent.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
 
                         val native = keyEvent.nativeKeyEvent
@@ -1152,12 +1229,11 @@ fun AdBlockWebViewScreen(
             )
         }
 
-        val activeNativeEpisode = nativePlayerEpisode
-        if (activeNativeEpisode != null) {
-            VlcPlayerScreen(
-                episodes = listOf(activeNativeEpisode),
-                initialEpisode = activeNativeEpisode,
-                onClose = { nativePlayerEpisode = null }
+        val activeNativeSpec = nativeStreamSpec
+        if (activeNativeSpec != null) {
+            NativeHlsPlayerScreen(
+                stream = activeNativeSpec,
+                onClose = { closeNativePlayer() }
             )
         }
     }
@@ -1237,21 +1313,49 @@ private const val AD_BLOCK_JS = """
             if (!rawUrl || typeof rawUrl !== 'string') { return; }
             const trimmed = rawUrl.trim();
             if (!trimmed || trimmed.indexOf('blob:') === 0 || trimmed.indexOf('data:') === 0) { return; }
-            const abs = new URL(trimmed, location.href).href;
+            const abs = new URL(trimmed, window.location.href).href;
             if (!/^https?:\/\//i.test(abs)) { return; }
             if (abs.toLowerCase().indexOf('.m3u8') === -1) { return; }
             if (window.AdBlockBridge && window.AdBlockBridge.onM3u8Detected) {
                 window.AdBlockBridge.onM3u8Detected(JSON.stringify({
                     m3u8Url: abs,
-                    referer: location.href || document.referrer || '',
-                    origin: (location.origin && location.origin !== 'null') ? location.origin : '',
+                    referer: window.location.href || document.referrer || '',
+                    origin: (window.location.origin && window.location.origin !== 'null') ? window.location.origin : '',
                     userAgent: navigator.userAgent || ''
                 }));
             }
         } catch (e) {}
     }
 
-    // 1. Detect .m3u8 requests via XHR, fetch, and native <video> loadstart
+    // 1. Strip restrictive iframe sandbox attributes & watch media src attributes (never touch window.open)
+    function stripSandboxIframes(root) {
+        try {
+            if (root && root.nodeType === 1 && root.tagName === 'IFRAME' && root.hasAttribute('sandbox')) {
+                root.removeAttribute('sandbox');
+            }
+            const scope = root && root.querySelectorAll ? root : document;
+            const frames = scope.querySelectorAll('iframe[sandbox]');
+            for (let i = 0; i < frames.length; i++) {
+                frames[i].removeAttribute('sandbox');
+            }
+        } catch (e) {}
+    }
+
+    try {
+        const origSetAttr = Element.prototype.setAttribute;
+        Element.prototype.setAttribute = function(name, value) {
+            if (this && this.tagName === 'IFRAME' && String(name).toLowerCase() === 'sandbox') {
+                return;
+            }
+            if (this && (this.tagName === 'VIDEO' || this.tagName === 'SOURCE') &&
+                String(name).toLowerCase() === 'src') {
+                reportM3u8(value);
+            }
+            return origSetAttr.apply(this, arguments);
+        };
+    } catch (e) {}
+
+    // 2. Detect .m3u8 requests via XHR, fetch, HTMLMediaElement.src, and native <video> loadstart
     try {
         const origOpen = XMLHttpRequest.prototype.open;
         XMLHttpRequest.prototype.open = function(method, url) {
@@ -1277,6 +1381,30 @@ private const val AD_BLOCK_JS = """
     } catch (e) {}
 
     try {
+        const mediaSrcDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
+        if (mediaSrcDesc && mediaSrcDesc.configurable && typeof mediaSrcDesc.set === 'function') {
+            Object.defineProperty(HTMLMediaElement.prototype, 'src', {
+                configurable: true,
+                enumerable: mediaSrcDesc.enumerable,
+                get: mediaSrcDesc.get,
+                set: function(val) {
+                    if (typeof val === 'string') { reportM3u8(val); }
+                    return mediaSrcDesc.set.call(this, val);
+                }
+            });
+        }
+    } catch (e) {}
+
+    function scanMediaElements() {
+        try {
+            const nodes = document.querySelectorAll('video, source');
+            for (let i = 0; i < nodes.length; i++) {
+                reportM3u8(nodes[i].currentSrc || nodes[i].src);
+            }
+        } catch (e) {}
+    }
+
+    try {
         document.addEventListener('loadstart', function(ev) {
             const t = ev && ev.target;
             if (!t || t.tagName !== 'VIDEO') { return; }
@@ -1287,28 +1415,14 @@ private const val AD_BLOCK_JS = """
         }, true);
     } catch (e) {}
 
-    // 2. Player-safe minimal CSS ad hiding
+    // 3. Player-safe minimal CSS ad hiding
     try {
         const styleEl = document.createElement('style');
         styleEl.textContent = '.ad, .ads, .adsbygoogle, [id^="google_ads"], iframe[src*="ads"], iframe[src*="doubleclick"] { display: none !important; }';
         (document.head || document.documentElement).appendChild(styleEl);
     } catch (e) {}
 
-    // 3. Block window.open popups, alerts, and beforeunload traps
-    const blockedOpen = function() {
-        reportBlock('window_open');
-        return null;
-    };
-    try {
-        Object.defineProperty(window, 'open', {
-            value: blockedOpen,
-            writable: false,
-            configurable: false
-        });
-    } catch (e) {
-        window.open = blockedOpen;
-    }
-
+    // 4. Neutralize alert & beforeunload traps (without altering window.open)
     try {
         Object.defineProperty(window, 'alert', {
             value: function() { reportBlock('alert'); },
@@ -1338,7 +1452,7 @@ private const val AD_BLOCK_JS = """
         return origAddEventListener.call(this, type, listener, options);
     };
 
-    // 4. Player-safe fake VPN banner remover (never touches players, iframes, or large wrappers)
+    // 5. Player-safe fake VPN banner remover (never touches players, iframes, or large wrappers)
     const PLAYER_SAFE_SELECTOR = 'video, iframe, canvas, .jwplayer, .jw-wrapper, [data-player], [id*="player" i], [class*="player" i], .clappr-player';
 
     function isPlayerProtected(el) {
@@ -1387,14 +1501,49 @@ private const val AD_BLOCK_JS = """
         } catch (e) {}
     }
 
+    try {
+        const sandboxObserver = new MutationObserver(function(mutations) {
+            if (!mutations) { return; }
+            for (let i = 0; i < mutations.length; i++) {
+                const m = mutations[i];
+                if (m.type === 'attributes' && m.target) {
+                    stripSandboxIframes(m.target);
+                } else if (m.addedNodes) {
+                    for (let j = 0; j < m.addedNodes.length; j++) {
+                        stripSandboxIframes(m.addedNodes[j]);
+                    }
+                }
+            }
+        });
+        const obsRoot = document.documentElement || document.body;
+        if (obsRoot) {
+            sandboxObserver.observe(obsRoot, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ['sandbox']
+            });
+        }
+    } catch (e) {}
+
+    stripSandboxIframes(document);
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', hideFakeVpnBanners, { once: true });
+        document.addEventListener('DOMContentLoaded', function() {
+            stripSandboxIframes(document);
+            hideFakeVpnBanners();
+            scanMediaElements();
+        }, { once: true });
     } else {
         hideFakeVpnBanners();
+        scanMediaElements();
     }
-    window.addEventListener('load', hideFakeVpnBanners, { once: true });
-    setTimeout(hideFakeVpnBanners, 600);
-    setTimeout(hideFakeVpnBanners, 1600);
-    setTimeout(hideFakeVpnBanners, 3500);
+    window.addEventListener('load', function() {
+        stripSandboxIframes(document);
+        hideFakeVpnBanners();
+        scanMediaElements();
+    }, { once: true });
+    setTimeout(function() { stripSandboxIframes(document); hideFakeVpnBanners(); scanMediaElements(); }, 600);
+    setTimeout(function() { stripSandboxIframes(document); hideFakeVpnBanners(); scanMediaElements(); }, 1600);
+    setTimeout(function() { stripSandboxIframes(document); hideFakeVpnBanners(); scanMediaElements(); }, 3500);
 })();
 """

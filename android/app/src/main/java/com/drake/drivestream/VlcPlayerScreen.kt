@@ -8,6 +8,7 @@ import android.os.Handler
 import android.os.Looper
 import android.view.KeyEvent
 import android.view.WindowManager
+import androidx.annotation.OptIn
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
@@ -44,6 +45,7 @@ import androidx.compose.material.icons.filled.Replay10
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Subtitles
+import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
@@ -77,12 +79,24 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.okhttp.OkHttpDataSource
+import androidx.media3.exoplayer.DefaultRenderersFactory
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.delay
+import okhttp3.OkHttpClient
 import org.videolan.libvlc.LibVLC
 import org.videolan.libvlc.Media
 import org.videolan.libvlc.MediaPlayer
 import org.videolan.libvlc.util.VLCVideoLayout
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 
 data class PlayerEpisode(
     val id: String,
@@ -103,6 +117,12 @@ private data class VlcTrackOption(
     val name: String
 )
 
+private enum class DriveVideoEngine(val label: String) {
+    VLC("VLC"),
+    EXOPLAYER("ExoPlayer")
+}
+
+@OptIn(UnstableApi::class)
 @Composable
 fun VlcPlayerScreen(
     episodes: List<PlayerEpisode>,
@@ -115,12 +135,19 @@ fun VlcPlayerScreen(
     val proxyStatus by proxy.lastProxyStatus.collectAsState()
     val playbackStore = remember(context) { PlaybackStore.getInstance(context) }
     val syncManager = remember(context) { SyncManager.getInstance(context) }
+    val driveSettings = remember(context) { DriveSettings.getInstance(context) }
+    val audioDelayMs by driveSettings.audioDelayMs.collectAsState()
 
     val queue = remember(episodes, initialEpisode) {
         episodes.ifEmpty { listOf(initialEpisode) }
     }
 
     var currentEpisode by remember { mutableStateOf(initialEpisode) }
+    var activeEngine by remember { mutableStateOf(DriveVideoEngine.VLC) }
+    var activeExoPlayer by remember { mutableStateOf<ExoPlayer?>(null) }
+    var exoCaptionsEnabled by remember { mutableStateOf(false) }
+    var pendingResumeSec by remember { mutableStateOf<Double?>(null) }
+
     var isLoading by remember { mutableStateOf(true) }
     var isPlaying by remember { mutableStateOf(false) }
     var currentTimeSec by remember { mutableDoubleStateOf(0.0) }
@@ -154,11 +181,23 @@ fun VlcPlayerScreen(
     val playerRootFocusRequester = remember { FocusRequester() }
     val playPauseFocusRequester = remember { FocusRequester() }
 
+    val exoOkHttpClient = remember {
+        OkHttpClient.Builder()
+            .connectTimeout(25, TimeUnit.SECONDS)
+            .readTimeout(0, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .build()
+    }
+
     val libVlc = remember(context) {
         LibVLC(
             context,
             arrayListOf(
-                "--network-caching=2000",
+                "--network-caching=1000",
+                "--file-caching=1000",
+                "--clock-jitter=0",
+                "--aout=android_audiotrack",
                 "--no-sub-autodetect-file"
             )
         )
@@ -185,6 +224,31 @@ fun VlcPlayerScreen(
         syncManager.scheduleSyncAfterChange()
     }
 
+    fun adjustAudioDelay(deltaMs: Long) {
+        val next = (driveSettings.audioDelayMs.value + deltaMs).coerceIn(
+            DriveSettings.MIN_AUDIO_DELAY_MS,
+            DriveSettings.MAX_AUDIO_DELAY_MS
+        )
+        driveSettings.setAudioDelayMs(next)
+        if (activeEngine == DriveVideoEngine.VLC) {
+            runCatching { mediaPlayer.setAudioDelay(next * 1000L) }
+        }
+        val sign = if (next > 0) "+" else ""
+        skipFeedback = "Audio Sync: $sign${next}ms"
+        skipFeedbackTick += 1
+        hudInteractionTick += 1
+    }
+
+    fun releaseActiveExoPlayer() {
+        activeExoPlayer?.let { exo ->
+            runCatching {
+                exo.stop()
+                exo.release()
+            }
+        }
+        activeExoPlayer = null
+    }
+
     fun seekTo(targetSec: Double) {
         if (!targetSec.isFinite()) return
         val upper = if (durationSec > 0.0) durationSec else maxOf(targetSec, currentTimeSec)
@@ -192,10 +256,15 @@ fun VlcPlayerScreen(
         seekIgnoreUntilMs = System.currentTimeMillis() + 1_200L
         currentTimeSec = clamped
         val targetMs = (clamped * 1000.0).toLong().coerceAtLeast(0L)
-        if (durationSec > 0.0) {
-            mediaPlayer.position = (clamped / durationSec).toFloat()
+        val exo = activeExoPlayer
+        if (exo != null) {
+            exo.seekTo(targetMs)
+        } else {
+            if (durationSec > 0.0) {
+                mediaPlayer.position = (clamped / durationSec).toFloat()
+            }
+            mediaPlayer.time = targetMs
         }
-        mediaPlayer.time = targetMs
     }
 
     fun skipBy(deltaSeconds: Double) {
@@ -206,7 +275,17 @@ fun VlcPlayerScreen(
     }
 
     fun togglePlayPause() {
-        if (mediaPlayer.isPlaying) {
+        val exo = activeExoPlayer
+        if (exo != null) {
+            if (exo.isPlaying) {
+                exo.pause()
+                isPlaying = false
+                persistAndSyncProgress()
+            } else {
+                exo.play()
+                isPlaying = true
+            }
+        } else if (mediaPlayer.isPlaying) {
             mediaPlayer.pause()
             isPlaying = false
         } else {
@@ -237,6 +316,15 @@ fun VlcPlayerScreen(
     fun toggleClosedCaptions() {
         userToggledSubtitles = true
         hudInteractionTick += 1
+        val exo = activeExoPlayer
+        if (exo != null) {
+            val nextEnabled = !exoCaptionsEnabled
+            exoCaptionsEnabled = nextEnabled
+            exo.trackSelectionParameters = exo.trackSelectionParameters.buildUpon()
+                .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, !nextEnabled)
+                .build()
+            return
+        }
         if (currentSubtitleTrackId != -1) {
             preferredSubtitleTrackId = currentSubtitleTrackId
             mediaPlayer.spuTrack = -1
@@ -252,15 +340,23 @@ fun VlcPlayerScreen(
         }
     }
 
-    fun startEpisode(episode: PlayerEpisode) {
+    fun startEpisode(
+        episode: PlayerEpisode,
+        engineOverride: DriveVideoEngine = activeEngine,
+        overrideResumeSec: Double? = null
+    ) {
         if (episode.id != currentEpisode.id) {
             saveProgress(force = true)
         }
         mediaPlayer.stop()
+        releaseActiveExoPlayer()
+
+        activeEngine = engineOverride
         currentEpisode = episode
+        pendingResumeSec = overrideResumeSec?.takeIf { it > 1.0 }
         isLoading = true
         isPlaying = false
-        currentTimeSec = 0.0
+        currentTimeSec = overrideResumeSec?.coerceAtLeast(0.0) ?: 0.0
         durationSec = 0.0
         audioTracks = emptyList()
         subtitleTracks = emptyList()
@@ -291,15 +387,106 @@ fun VlcPlayerScreen(
         } else {
             proxy.streamUrl(episode.id)
         }
+
+        if (engineOverride == DriveVideoEngine.EXOPLAYER) {
+            val renderersFactory = DefaultRenderersFactory(context)
+                .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
+                .setEnableDecoderFallback(true)
+            val dataSourceFactory = OkHttpDataSource.Factory(exoOkHttpClient)
+            val player = ExoPlayer.Builder(context, renderersFactory)
+                .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
+                .build()
+            exoCaptionsEnabled = false
+            player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+                .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+                .build()
+            player.addListener(object : Player.Listener {
+                override fun onPlaybackStateChanged(playbackState: Int) {
+                    if (isPlayerDisposed || activeExoPlayer !== player) return
+                    when (playbackState) {
+                        Player.STATE_BUFFERING -> {
+                            isLoading = true
+                            statusMessage = "Buffering ExoPlayer…"
+                        }
+                        Player.STATE_READY -> {
+                            isLoading = false
+                            errorMessage = null
+                            val durMs = player.duration
+                            if (durMs != C.TIME_UNSET && durMs > 0L) {
+                                durationSec = durMs / 1000.0
+                            }
+                            if (!didAttemptResume) {
+                                didAttemptResume = true
+                                val manualSec = pendingResumeSec
+                                pendingResumeSec = null
+                                if (manualSec != null && manualSec > 1.0) {
+                                    player.seekTo((manualSec * 1000.0).toLong())
+                                } else if (!currentEpisode.isLiveStream && durationSec > 0.0) {
+                                    val saved = playbackStore.progress(currentEpisode.id)
+                                    if (saved != null && saved.position > 1.0 && saved.position / durationSec < 0.95) {
+                                        player.seekTo((saved.position * 1000.0).toLong())
+                                    }
+                                }
+                            }
+                            isPlaying = player.isPlaying
+                        }
+                        Player.STATE_ENDED -> {
+                            isPlaying = false
+                            persistAndSyncProgress()
+                            if (hasNext) {
+                                startEpisode(queue[currentIndex + 1], engineOverride = DriveVideoEngine.EXOPLAYER)
+                            }
+                        }
+                    }
+                }
+
+                override fun onIsPlayingChanged(playing: Boolean) {
+                    if (isPlayerDisposed || activeExoPlayer !== player) return
+                    isPlaying = playing
+                    if (playing) {
+                        isLoading = false
+                        errorMessage = null
+                    }
+                }
+
+                override fun onPlayerError(error: PlaybackException) {
+                    if (isPlayerDisposed || activeExoPlayer !== player) return
+                    isLoading = false
+                    isPlaying = false
+                    errorMessage = "ExoPlayer error (${error.errorCodeName}). Try switching Engine to VLC."
+                }
+            })
+            activeExoPlayer = player
+            player.setMediaItem(MediaItem.fromUri(resolvedUrl))
+            player.playWhenReady = true
+            player.prepare()
+            return
+        }
+
         val streamUri = Uri.parse(resolvedUrl)
         val media = Media(libVlc, streamUri).apply {
-            addOption(":network-caching=2000")
+            addOption(":network-caching=1000")
+            addOption(":file-caching=1000")
+            addOption(":clock-jitter=0")
             addOption(":no-sub-autodetect-file")
         }
         mediaPlayer.media = media
         media.release()
         mediaPlayer.spuTrack = -1
         mediaPlayer.play()
+    }
+
+    fun toggleEngine() {
+        val resumeSec = currentTimeSec
+        val nextEngine = if (activeEngine == DriveVideoEngine.VLC) {
+            DriveVideoEngine.EXOPLAYER
+        } else {
+            DriveVideoEngine.VLC
+        }
+        skipFeedback = "Engine: ${nextEngine.label}"
+        skipFeedbackTick += 1
+        hudInteractionTick += 1
+        startEpisode(currentEpisode, engineOverride = nextEngine, overrideResumeSec = resumeSec)
     }
 
     // Keep TV screen awake during playback
@@ -316,7 +503,7 @@ fun VlcPlayerScreen(
         isPlayerDisposed = false
         mediaPlayer.setEventListener { event ->
             mainHandler.post {
-                if (isPlayerDisposed) return@post
+                if (isPlayerDisposed || activeEngine != DriveVideoEngine.VLC) return@post
                 when (event.type) {
                     MediaPlayer.Event.Opening -> {
                         statusMessage = "Opening stream…"
@@ -330,6 +517,9 @@ fun VlcPlayerScreen(
                         isPlaying = true
                         isLoading = false
                         errorMessage = null
+                        runCatching {
+                            mediaPlayer.setAudioDelay(driveSettings.audioDelayMs.value * 1000L)
+                        }
                         if (!didDisableInitialSubtitles && !userToggledSubtitles) {
                             didDisableInitialSubtitles = true
                             mediaPlayer.spuTrack = -1
@@ -370,11 +560,17 @@ fun VlcPlayerScreen(
                         if (len > 0L) {
                             durationSec = len / 1000.0
                         }
-                        if (!currentEpisode.isLiveStream && !didAttemptResume && durationSec > 0.0) {
+                        if (!didAttemptResume && durationSec > 0.0) {
                             didAttemptResume = true
-                            val saved = playbackStore.progress(currentEpisode.id)
-                            if (saved != null && saved.position > 1.0 && saved.position / durationSec < 0.95) {
-                                seekTo(saved.position)
+                            val manualSec = pendingResumeSec
+                            pendingResumeSec = null
+                            if (manualSec != null && manualSec > 1.0) {
+                                seekTo(manualSec)
+                            } else if (!currentEpisode.isLiveStream) {
+                                val saved = playbackStore.progress(currentEpisode.id)
+                                if (saved != null && saved.position > 1.0 && saved.position / durationSec < 0.95) {
+                                    seekTo(saved.position)
+                                }
                             }
                         }
                         if (!didDisableInitialSubtitles && !userToggledSubtitles) {
@@ -405,11 +601,28 @@ fun VlcPlayerScreen(
         onDispose {
             isPlayerDisposed = true
             persistAndSyncProgress()
+            releaseActiveExoPlayer()
             mediaPlayer.setEventListener(null)
             mediaPlayer.stop()
             mediaPlayer.detachViews()
             mediaPlayer.release()
             libVlc.release()
+        }
+    }
+
+    LaunchedEffect(activeExoPlayer) {
+        val exo = activeExoPlayer ?: return@LaunchedEffect
+        while (!isPlayerDisposed && activeExoPlayer === exo) {
+            if (System.currentTimeMillis() >= seekIgnoreUntilMs) {
+                currentTimeSec = (exo.currentPosition.coerceAtLeast(0L)) / 1000.0
+            }
+            val durMs = exo.duration
+            if (durMs != C.TIME_UNSET && durMs > 0L) {
+                durationSec = durMs / 1000.0
+            }
+            isPlaying = exo.isPlaying
+            saveProgress(force = false)
+            delay(400L)
         }
     }
 
@@ -520,23 +733,44 @@ fun VlcPlayerScreen(
                 }
             }
     ) {
-        AndroidView(
-            factory = { viewCtx ->
-                VLCVideoLayout(viewCtx).also { layout ->
-                    mediaPlayer.attachViews(layout, null, false, false)
-                    if (!didStartInitialPlayback) {
-                        didStartInitialPlayback = true
-                        layout.post {
-                            if (!isPlayerDisposed) {
-                                startEpisode(initialEpisode)
+        if (activeEngine == DriveVideoEngine.EXOPLAYER) {
+            AndroidView(
+                factory = { viewCtx ->
+                    PlayerView(viewCtx).apply {
+                        useController = false
+                        keepScreenOn = true
+                        player = activeExoPlayer
+                    }
+                },
+                update = { view ->
+                    view.player = activeExoPlayer
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+        } else {
+            DisposableEffect(mediaPlayer) {
+                onDispose {
+                    mediaPlayer.detachViews()
+                }
+            }
+            AndroidView(
+                factory = { viewCtx ->
+                    VLCVideoLayout(viewCtx).also { layout ->
+                        mediaPlayer.attachViews(layout, null, false, false)
+                        if (!didStartInitialPlayback) {
+                            didStartInitialPlayback = true
+                            layout.post {
+                                if (!isPlayerDisposed) {
+                                    startEpisode(initialEpisode)
+                                }
                             }
                         }
                     }
-                }
-            },
-            update = {},
-            modifier = Modifier.fillMaxSize()
-        )
+                },
+                update = {},
+                modifier = Modifier.fillMaxSize()
+            )
+        }
 
         if (isLoading && errorMessage == null) {
             Column(
@@ -636,12 +870,34 @@ fun VlcPlayerScreen(
                         }
                     }
 
-                    if (queue.size > 1) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        if (activeEngine == DriveVideoEngine.VLC) {
+                            AudioSyncControl(
+                                delayMs = audioDelayMs,
+                                onDecrease = { adjustAudioDelay(-50L) },
+                                onReset = { adjustAudioDelay(DriveSettings.DEFAULT_AUDIO_DELAY_MS - audioDelayMs) },
+                                onIncrease = { adjustAudioDelay(50L) }
+                            )
+                        }
+
                         PlayerPillButton(
-                            label = "Episodes (${queue.size})",
-                            icon = Icons.Default.List
+                            label = "Engine: ${activeEngine.label}",
+                            icon = Icons.Default.SwapHoriz,
+                            isPrimary = activeEngine == DriveVideoEngine.EXOPLAYER
                         ) {
-                            showEpisodeDrawer = true
+                            toggleEngine()
+                        }
+
+                        if (queue.size > 1) {
+                            PlayerPillButton(
+                                label = "Episodes (${queue.size})",
+                                icon = Icons.Default.List
+                            ) {
+                                showEpisodeDrawer = true
+                            }
                         }
                     }
                 }
@@ -739,11 +995,16 @@ fun VlcPlayerScreen(
 
                         Spacer(Modifier.width(24.dp))
 
+                        val captionsActive = if (activeExoPlayer != null) {
+                            exoCaptionsEnabled
+                        } else {
+                            currentSubtitleTrackId != -1
+                        }
                         PlayerPillButton(
-                            label = if (currentSubtitleTrackId != -1) "CC ON" else "CC OFF",
+                            label = if (captionsActive) "CC ON" else "CC OFF",
                             icon = Icons.Default.ClosedCaption,
-                            isPrimary = currentSubtitleTrackId != -1,
-                            enabled = selectableSubtitles.isNotEmpty()
+                            isPrimary = captionsActive,
+                            enabled = activeExoPlayer != null || selectableSubtitles.isNotEmpty()
                         ) {
                             toggleClosedCaptions()
                         }
@@ -859,7 +1120,93 @@ fun VlcPlayerScreen(
 }
 
 @Composable
-private fun PlayerIconButton(
+private fun AudioSyncControl(
+    delayMs: Long,
+    onDecrease: () -> Unit,
+    onReset: () -> Unit,
+    onIncrease: () -> Unit
+) {
+    val sign = if (delayMs > 0) "+" else ""
+    var labelFocused by remember { mutableStateOf(false) }
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(22.dp))
+            .background(Color.White.copy(alpha = 0.12f))
+            .border(1.dp, Color.White.copy(alpha = 0.22f), RoundedCornerShape(22.dp))
+            .padding(horizontal = 6.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        AudioSyncStepButton(
+            label = "-",
+            enabled = delayMs > DriveSettings.MIN_AUDIO_DELAY_MS,
+            onClick = onDecrease
+        )
+        Text(
+            text = "Audio Sync: $sign${delayMs}ms",
+            color = Color.White,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier
+                .clip(RoundedCornerShape(14.dp))
+                .background(if (labelFocused) Color(0xFF3B82F6) else Color.Transparent)
+                .border(
+                    width = if (labelFocused) 2.dp else 0.dp,
+                    color = if (labelFocused) Color.White else Color.Transparent,
+                    shape = RoundedCornerShape(14.dp)
+                )
+                .onFocusChanged { labelFocused = it.isFocused }
+                .focusable()
+                .clickable(onClick = onReset)
+                .padding(horizontal = 8.dp, vertical = 5.dp)
+        )
+        AudioSyncStepButton(
+            label = "+",
+            enabled = delayMs < DriveSettings.MAX_AUDIO_DELAY_MS,
+            onClick = onIncrease
+        )
+    }
+}
+
+@Composable
+private fun AudioSyncStepButton(
+    label: String,
+    enabled: Boolean,
+    onClick: () -> Unit
+) {
+    var focused by remember { mutableStateOf(false) }
+    Box(
+        modifier = Modifier
+            .size(30.dp)
+            .clip(CircleShape)
+            .background(
+                when {
+                    focused -> Color(0xFF3B82F6)
+                    enabled -> Color.White.copy(alpha = 0.18f)
+                    else -> Color.White.copy(alpha = 0.06f)
+                }
+            )
+            .border(
+                width = if (focused) 2.dp else 0.dp,
+                color = if (focused) Color.White else Color.Transparent,
+                shape = CircleShape
+            )
+            .onFocusChanged { focused = it.isFocused }
+            .focusable(enabled)
+            .clickable(enabled = enabled, onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = label,
+            color = if (enabled) Color.White else Color.White.copy(alpha = 0.35f),
+            fontSize = 15.sp,
+            fontWeight = FontWeight.Bold
+        )
+    }
+}
+
+@Composable
+internal fun PlayerIconButton(
     icon: ImageVector,
     contentDescription: String,
     modifier: Modifier = Modifier,
@@ -905,7 +1252,7 @@ private fun PlayerIconButton(
 }
 
 @Composable
-private fun PlayerPillButton(
+internal fun PlayerPillButton(
     label: String,
     icon: ImageVector? = null,
     isPrimary: Boolean = false,
@@ -1043,7 +1390,7 @@ private fun ModalOptionRow(
     }
 }
 
-private fun formatDuration(seconds: Double): String {
+internal fun formatDuration(seconds: Double): String {
     val total = seconds.toInt().coerceAtLeast(0)
     val h = total / 3600
     val m = (total % 3600) / 60
@@ -1055,7 +1402,7 @@ private fun formatDuration(seconds: Double): String {
     }
 }
 
-private tailrec fun Context.findActivity(): Activity? = when (this) {
+internal tailrec fun Context.findActivity(): Activity? = when (this) {
     is Activity -> this
     is ContextWrapper -> baseContext.findActivity()
     else -> null

@@ -42,7 +42,9 @@ class LocalStreamProxy private constructor(private val appContext: Context) {
     data class HlsHeaderSession(
         val referer: String,
         val origin: String,
-        val userAgent: String
+        val userAgent: String,
+        val cookie: String = "",
+        val extraHeaders: Map<String, String> = emptyMap()
     )
 
     private val hlsSessions = ConcurrentHashMap<String, HlsHeaderSession>()
@@ -89,13 +91,21 @@ class LocalStreamProxy private constructor(private val appContext: Context) {
         return "http://127.0.0.1:$PORT/stream/${Uri.encode(fileId)}"
     }
 
-    fun registerHlsSession(referer: String, origin: String, userAgent: String): String {
+    fun registerHlsSession(
+        referer: String,
+        origin: String,
+        userAgent: String,
+        cookie: String = "",
+        extraHeaders: Map<String, String> = emptyMap()
+    ): String {
         val id = hlsCounter.incrementAndGet()
         val sid = id.toString()
         hlsSessions[sid] = HlsHeaderSession(
             referer = referer.trim(),
             origin = origin.trim(),
-            userAgent = userAgent.trim()
+            userAgent = userAgent.trim(),
+            cookie = cookie.trim(),
+            extraHeaders = extraHeaders
         )
         if (hlsSessions.size > 32) {
             val minKeep = (id - 16).coerceAtLeast(0L)
@@ -237,11 +247,20 @@ class LocalStreamProxy private constructor(private val appContext: Context) {
             .header("Accept-Encoding", "identity")
 
         headers["range"]?.takeIf { it.isNotBlank() }?.let { reqBuilder.header("Range", it) }
+        session?.extraHeaders?.forEach { (k, v) ->
+            if (k.isNotBlank() && v.isNotBlank()) {
+                reqBuilder.header(k, v)
+            }
+        }
         session?.referer?.takeIf { it.isNotBlank() }?.let { reqBuilder.header("Referer", it) }
         session?.origin?.takeIf { it.isNotBlank() }?.let { reqBuilder.header("Origin", it) }
         session?.userAgent?.takeIf { it.isNotBlank() }?.let { reqBuilder.header("User-Agent", it) }
-        val cookieHeader = runCatching { CookieManager.getInstance().getCookie(targetUrl) }.getOrNull()
-        if (!cookieHeader.isNullOrBlank()) {
+        val refCookie = session?.referer?.takeIf { it.isNotBlank() }?.let { refUrl ->
+            runCatching { CookieManager.getInstance().getCookie(refUrl) }.getOrNull()
+        }
+        val targetCookie = runCatching { CookieManager.getInstance().getCookie(targetUrl) }.getOrNull()
+        val cookieHeader = mergeCookieHeaders(session?.cookie, refCookie, targetCookie)
+        if (cookieHeader.isNotBlank()) {
             reqBuilder.header("Cookie", cookieHeader)
         }
 
@@ -499,4 +518,23 @@ class LocalStreamProxy private constructor(private val appContext: Context) {
             }
         }
     }
+}
+
+internal fun mergeCookieHeaders(vararg rawHeaders: String?): String {
+    val map = LinkedHashMap<String, String>()
+    for (header in rawHeaders) {
+        if (header.isNullOrBlank()) continue
+        header.split(';').forEach { part ->
+            val trimmed = part.trim()
+            val eq = trimmed.indexOf('=')
+            if (eq > 0) {
+                val name = trimmed.substring(0, eq).trim()
+                val value = trimmed.substring(eq + 1).trim()
+                if (name.isNotEmpty()) {
+                    map[name] = value
+                }
+            }
+        }
+    }
+    return map.entries.joinToString("; ") { "${it.key}=${it.value}" }
 }

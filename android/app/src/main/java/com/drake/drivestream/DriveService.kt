@@ -85,6 +85,12 @@ class DriveSettings private constructor(context: Context) {
     private val _folderId = MutableStateFlow(loadInitialFolderId())
     val folderId: StateFlow<String> = _folderId.asStateFlow()
 
+    private val _audioDelayMs = MutableStateFlow(
+        prefs.getLong(KEY_AUDIO_DELAY_MS, DEFAULT_AUDIO_DELAY_MS)
+            .coerceIn(MIN_AUDIO_DELAY_MS, MAX_AUDIO_DELAY_MS)
+    )
+    val audioDelayMs: StateFlow<Long> = _audioDelayMs.asStateFlow()
+
     private fun loadInitialFolderId(): String {
         if (!prefs.contains(KEY_FOLDER_ID)) {
             return DriveService.DEFAULT_FOLDER_ID
@@ -98,8 +104,18 @@ class DriveSettings private constructor(context: Context) {
         _folderId.value = trimmed
     }
 
+    fun setAudioDelayMs(delayMs: Long) {
+        val clamped = delayMs.coerceIn(MIN_AUDIO_DELAY_MS, MAX_AUDIO_DELAY_MS)
+        prefs.edit().putLong(KEY_AUDIO_DELAY_MS, clamped).apply()
+        _audioDelayMs.value = clamped
+    }
+
     companion object {
+        const val DEFAULT_AUDIO_DELAY_MS = -200L
+        const val MIN_AUDIO_DELAY_MS = -500L
+        const val MAX_AUDIO_DELAY_MS = 500L
         private const val KEY_FOLDER_ID = "drive_folder_id"
+        private const val KEY_AUDIO_DELAY_MS = "audio_delay_ms"
 
         @Volatile
         private var instance: DriveSettings? = null

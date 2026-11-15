@@ -527,7 +527,7 @@ private final class AdBlockBrowserViewModel: NSObject, ObservableObject, WKNavig
         }
 
         webView.evaluateJavaScript(
-            "document.querySelectorAll('video').forEach(function(v){try{v.pause();}catch(e){}});",
+            "document.querySelectorAll('video, audio').forEach(function(e){try{e.pause();}catch(_){}});",
             completionHandler: nil
         )
 
@@ -814,20 +814,33 @@ private final class AdBlockBrowserViewModel: NSObject, ObservableObject, WKNavig
             postBridge({ type: kind });
         }
 
-        // 1. Block window.open popups
-        const blockedOpen = function() {
-            reportBlock('window_open');
-            return null;
-        };
-        try {
-            Object.defineProperty(window, 'open', {
-                value: blockedOpen,
-                writable: false,
-                configurable: false
-            });
-        } catch (e) {
-            window.open = blockedOpen;
+        // 1. Strip restrictive iframe sandbox attributes without touching window.open
+        function stripSandboxIframes(root) {
+            try {
+                if (root && root.nodeType === 1 && root.tagName === 'IFRAME' && root.hasAttribute('sandbox')) {
+                    root.removeAttribute('sandbox');
+                }
+                const scope = root && root.querySelectorAll ? root : document;
+                const frames = scope.querySelectorAll('iframe[sandbox]');
+                for (let i = 0; i < frames.length; i++) {
+                    frames[i].removeAttribute('sandbox');
+                }
+            } catch (e) {}
         }
+
+        try {
+            const origSetAttribute = Element.prototype.setAttribute;
+            Element.prototype.setAttribute = function(name, value) {
+                if (this && this.tagName === 'IFRAME' && String(name).toLowerCase() === 'sandbox') {
+                    return;
+                }
+                if (this && (this.tagName === 'VIDEO' || this.tagName === 'SOURCE') &&
+                    String(name).toLowerCase() === 'src') {
+                    reportM3u8(value);
+                }
+                return origSetAttribute.apply(this, arguments);
+            };
+        } catch (e) {}
 
         // 2. Disable window.alert and onbeforeunload traps
         try {
@@ -863,7 +876,9 @@ private final class AdBlockBrowserViewModel: NSObject, ObservableObject, WKNavig
         function reportM3u8(rawUrl) {
             try {
                 if (!rawUrl) { return; }
-                const absUrl = new URL(String(rawUrl), location.href).href;
+                const trimmed = String(rawUrl).trim();
+                if (!trimmed || trimmed.indexOf('blob:') === 0 || trimmed.indexOf('data:') === 0) { return; }
+                const absUrl = new URL(trimmed, window.location.href).href;
                 const lower = absUrl.toLowerCase();
                 if ((lower.indexOf('http://') !== 0 && lower.indexOf('https://') !== 0) ||
                     lower.indexOf('.m3u8') === -1) {
@@ -872,8 +887,8 @@ private final class AdBlockBrowserViewModel: NSObject, ObservableObject, WKNavig
                 postBridge({
                     type: 'm3u8_detected',
                     m3u8Url: absUrl,
-                    referer: document.referrer || location.href,
-                    origin: location.origin || '',
+                    referer: window.location.href || document.referrer || '',
+                    origin: (window.location.origin && window.location.origin !== 'null') ? window.location.origin : '',
                     userAgent: navigator.userAgent || ''
                 });
             } catch (e) {}
@@ -895,6 +910,21 @@ private final class AdBlockBrowserViewModel: NSObject, ObservableObject, WKNavig
                 return origFetch.apply(this, arguments);
             };
         }
+
+        try {
+            const mediaSrcDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
+            if (mediaSrcDesc && mediaSrcDesc.configurable && typeof mediaSrcDesc.set === 'function') {
+                Object.defineProperty(HTMLMediaElement.prototype, 'src', {
+                    configurable: true,
+                    enumerable: mediaSrcDesc.enumerable,
+                    get: mediaSrcDesc.get,
+                    set: function(val) {
+                        if (typeof val === 'string') { reportM3u8(val); }
+                        return mediaSrcDesc.set.call(this, val);
+                    }
+                });
+            }
+        } catch (e) {}
 
         function scanMediaElements() {
             try {
@@ -975,14 +1005,32 @@ private final class AdBlockBrowserViewModel: NSObject, ObservableObject, WKNavig
             }, 400);
         }
 
-        const observer = new MutationObserver(function() {
+        const observer = new MutationObserver(function(mutations) {
+            if (mutations) {
+                for (let i = 0; i < mutations.length; i++) {
+                    const m = mutations[i];
+                    if (m.type === 'attributes' && m.target) {
+                        stripSandboxIframes(m.target);
+                    } else if (m.addedNodes) {
+                        for (let j = 0; j < m.addedNodes.length; j++) {
+                            stripSandboxIframes(m.addedNodes[j]);
+                        }
+                    }
+                }
+            }
             scheduleBannerSweep();
         });
 
         function startBannerShield() {
             const root = document.body || document.documentElement;
             if (!root) { return; }
-            observer.observe(root, { childList: true, subtree: true });
+            stripSandboxIframes(document);
+            observer.observe(root, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ['sandbox']
+            });
             hideFakeVpnBanners();
             scanMediaElements();
         }
