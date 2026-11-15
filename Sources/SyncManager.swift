@@ -22,7 +22,7 @@ struct DriveStreamSyncState: Codable, Equatable {
     var watchProgress: [String: WatchProgressEntry] = [:]
     var customCovers: [String: CustomCoverMatch] = [:]
 
-    private enum CodingKeys: String, CodingKey {
+    enum CodingKeys: String, CodingKey {
         case version
         case savedLinks
         case deletedLinkIds
@@ -406,7 +406,7 @@ final class SyncManager: ObservableObject {
             let end = min(offset + batchSize, candidates.count)
             let batch = candidates[offset..<end]
 
-            let found = await withTaskGroup(of: String?.self) { group in
+            let found: String? = await withTaskGroup(of: String?.self, returning: String?.self) { group in
                 for ip in batch {
                     group.addTask {
                         guard let url = URL(string: "http://\(ip):\(SyncManager.peerPort)/api/sync") else {
