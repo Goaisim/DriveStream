@@ -335,6 +335,7 @@ fun TvMainScreen(libraryViewModel: LibraryViewModel = viewModel()) {
     var actionMenuLink by remember { mutableStateOf<SavedLink?>(null) }
     var coverFinderTarget by remember { mutableStateOf<CoverFinderTarget?>(null) }
     var showSettingsDialog by remember { mutableStateOf(false) }
+    var showSoulseekHub by remember { mutableStateOf(false) }
 
     LaunchedEffect(isAuthenticated, folderId) {
         if (isAuthenticated) {
@@ -370,6 +371,18 @@ fun TvMainScreen(libraryViewModel: LibraryViewModel = viewModel()) {
                 AdBlockWebViewScreen(
                     initialUrl = link.urlString,
                     onClose = { activeWebLink = null }
+                )
+            }
+
+            showSoulseekHub -> {
+                SoulseekHubOverlay(
+                    targetFolderId = folderId,
+                    onLibraryItemAdded = {
+                        if (isAuthenticated) {
+                            libraryViewModel.loadLibrary(folderId)
+                        }
+                    },
+                    onClose = { showSoulseekHub = false }
                 )
             }
 
@@ -438,6 +451,9 @@ fun TvMainScreen(libraryViewModel: LibraryViewModel = viewModel()) {
                         onOpenSettings = {
                             authManager.refreshLocalIp()
                             showSettingsDialog = true
+                        },
+                        onOpenSoulseek = {
+                            showSoulseekHub = true
                         }
                     )
                 }
@@ -739,7 +755,8 @@ private fun TvHomeContent(
     onRefresh: () -> Unit,
     onSignIn: () -> Unit,
     onSignInBuiltIn: () -> Unit,
-    onOpenSettings: () -> Unit
+    onOpenSettings: () -> Unit,
+    onOpenSoulseek: () -> Unit
 ) {
     val continueWatching = remember(items, progressMap) {
         items.mapNotNull { item ->
@@ -787,6 +804,13 @@ private fun TvHomeContent(
             }
 
             Spacer(Modifier.weight(1f))
+
+            TvActionButton(
+                label = "Add from Soulseek",
+                onClick = onOpenSoulseek
+            )
+
+            Spacer(Modifier.width(10.dp))
 
             TvActionButton(
                 label = "Add Link",
@@ -1673,7 +1697,7 @@ private fun AddEditLinkTvDialog(
 }
 
 @Composable
-private fun TvDialogFieldButton(
+internal fun TvDialogFieldButton(
     label: String,
     value: String,
     isPlaceholder: Boolean,
@@ -1709,7 +1733,7 @@ private fun TvDialogFieldButton(
 }
 
 @Composable
-private fun SingleFieldTvInputDialog(
+internal fun SingleFieldTvInputDialog(
     title: String,
     label: String,
     initialValue: String,
@@ -1961,13 +1985,19 @@ private fun TvSettingsDialog(
     onClearMetadataCache: () -> Unit,
     onSignOutOrSignIn: () -> Unit
 ) {
+    val context = LocalContext.current
+    val soulseek = remember { SoulseekService.getInstance(context) }
     val savedPeerHost by syncManager.peerHost.collectAsState()
+    val savedBridgeHost by syncManager.soulseekBridgeHost.collectAsState()
     val isSyncing by syncManager.isSyncing.collectAsState()
     val isScanning by syncManager.isScanning.collectAsState()
     val syncStatus by syncManager.statusMessage.collectAsState()
+    val isScanningBridge by soulseek.isScanning.collectAsState()
+    val bridgeStatus by soulseek.statusMessage.collectAsState()
 
     var draftFolderId by remember(currentFolderId) { mutableStateOf(currentFolderId) }
     var draftPeerHost by remember(savedPeerHost) { mutableStateOf(savedPeerHost) }
+    var draftBridgeHost by remember(savedBridgeHost) { mutableStateOf(savedBridgeHost) }
     var cacheCleared by remember { mutableStateOf(false) }
 
     BackHandler { onDismiss() }
@@ -2037,6 +2067,32 @@ private fun TvSettingsDialog(
                 )
             }
 
+            Text(
+                text = "Soulseek PC Bridge (:5031): $bridgeStatus",
+                color = Color(0xFF93C5FD),
+                fontSize = 12.sp
+            )
+
+            TvTextInput(
+                label = "Soulseek PC Bridge IP (e.g. 192.168.0.105)",
+                value = draftBridgeHost,
+                onValueChange = { draftBridgeHost = it },
+                onSubmit = { soulseek.setManualBridgeHost(draftBridgeHost) }
+            )
+
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                TvActionButton(
+                    label = "Save PC Bridge",
+                    enabled = !isScanningBridge,
+                    onClick = { soulseek.setManualBridgeHost(draftBridgeHost) }
+                )
+                TvActionButton(
+                    label = if (isScanningBridge) "Scanning PC…" else "Scan Wi-Fi for PC Bridge",
+                    enabled = !isScanningBridge,
+                    onClick = { soulseek.scanWiFiForBridge() }
+                )
+            }
+
             TvTextInput(
                 label = "Google Drive Folder ID (blank = all videos)",
                 value = draftFolderId,
@@ -2049,6 +2105,9 @@ private fun TvSettingsDialog(
                     isPrimary = true,
                     onClick = {
                         syncManager.setPeerHost(draftPeerHost)
+                        if (SyncManager.cleanHost(draftBridgeHost) != savedBridgeHost) {
+                            soulseek.setManualBridgeHost(draftBridgeHost)
+                        }
                         onSaveFolderId(draftFolderId)
                     }
                 )
@@ -2073,7 +2132,7 @@ private fun TvSettingsDialog(
 // MARK: - Shared TV Components
 
 @Composable
-private fun TvDialogSurface(
+internal fun TvDialogSurface(
     title: String,
     subtitle: String? = null,
     onDismiss: () -> Unit,
@@ -2117,7 +2176,7 @@ private fun TvDialogSurface(
 }
 
 @Composable
-private fun TvTextInput(
+internal fun TvTextInput(
     label: String,
     value: String,
     onValueChange: (String) -> Unit,
@@ -2179,7 +2238,7 @@ private fun TvTextInput(
 }
 
 @Composable
-private fun TvActionButton(
+internal fun TvActionButton(
     label: String,
     modifier: Modifier = Modifier,
     icon: ImageVector? = null,
@@ -2232,7 +2291,7 @@ private fun TvActionButton(
 }
 
 @Composable
-private fun TvIconCircleButton(
+internal fun TvIconCircleButton(
     icon: ImageVector,
     contentDescription: String,
     modifier: Modifier = Modifier,

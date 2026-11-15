@@ -17,3 +17,14 @@ DerivedData/
 build/
 .DS_Store
 *.xcuserstate
+
+# Soulseek Bridge runtime files (keep scripts tracked)
+soulseek-bridge/bin/
+soulseek-bridge/downloads/
+soulseek-bridge/incomplete/
+soulseek-bridge/logs/
+soulseek-bridge/.env
+soulseek-bridge/.bridge_state.json
+soulseek-bridge/slskd.yml
+soulseek-bridge/*.db
+soulseek-bridge/__pycache__/

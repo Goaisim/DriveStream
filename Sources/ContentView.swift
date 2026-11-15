@@ -399,6 +399,7 @@ private struct LibraryHomeView: View {
     @AppStorage("drive_folder_id") private var folderID = DriveService.defaultFolderID
 
     @State private var showSettings = false
+    @State private var showSoulseekHub = false
     @State private var activePlayback: ActivePlayback?
     @State private var coverFinderTarget: CoverFinderTarget?
     @State private var linkEditorMode: LinkEditorMode?
@@ -483,6 +484,12 @@ private struct LibraryHomeView: View {
 
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     Button {
+                        showSoulseekHub = true
+                    } label: {
+                        Label("Soulseek", systemImage: "arrow.down.circle.fill")
+                    }
+
+                    Button {
                         Task { await reload() }
                     } label: {
                         Image(systemName: "arrow.clockwise")
@@ -524,6 +531,16 @@ private struct LibraryHomeView: View {
                     folderID: $folderID,
                     onSaveOrChange: {
                         Task { await reload() }
+                    }
+                )
+            }
+            .sheet(isPresented: $showSoulseekHub) {
+                SoulseekView(
+                    targetFolderId: folderID,
+                    onLibraryItemAdded: {
+                        if authManager.isAuthenticated {
+                            await reload()
+                        }
                     }
                 )
             }
@@ -1233,8 +1250,10 @@ private struct SettingsView: View {
     @Binding var folderID: String
     let onSaveOrChange: () -> Void
 
+    @ObservedObject private var soulseek = SoulseekService.shared
     @State private var draftFolderID = ""
     @State private var draftPeerHost = ""
+    @State private var draftSoulseekHost = ""
     @State private var clearedCache = false
 
     var body: some View {
@@ -1315,6 +1334,42 @@ private struct SettingsView: View {
                 }
 
                 Section {
+                    HStack {
+                        Text("Bridge Status")
+                        Spacer()
+                        if soulseek.isScanning {
+                            ProgressView()
+                                .padding(.trailing, 6)
+                        }
+                        Text(soulseek.statusMessage)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    TextField("PC Bridge IP (e.g. 192.168.0.105)", text: $draftSoulseekHost)
+                        .keyboardType(.numbersAndPunctuation)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+
+                    Button {
+                        Task {
+                            await soulseek.scanWiFiForBridge()
+                            draftSoulseekHost = syncManager.soulseekBridgeHost
+                        }
+                    } label: {
+                        Label(
+                            soulseek.isScanning ? "Scanning Wi-Fi for PC Bridge…" : "Scan Wi-Fi for PC Bridge",
+                            systemImage: "wifi"
+                        )
+                    }
+                    .disabled(soulseek.isScanning)
+                } header: {
+                    Text("Soulseek PC Bridge (:5031)")
+                } footer: {
+                    Text("Connects to drive_uploader_bridge.py on your PC and syncs the bridge IP to your Fire TV / Shield.")
+                }
+
+                Section {
                     Button {
                         TMDBService.shared.clearCache()
                         clearedCache = true
@@ -1358,6 +1413,9 @@ private struct SettingsView: View {
                         let trimmedFolder = draftFolderID.trimmingCharacters(in: .whitespacesAndNewlines)
                         let changed = trimmedFolder != folderID || clearedCache
                         syncManager.peerHost = draftPeerHost
+                        if SyncManager.cleanHost(draftSoulseekHost) != syncManager.soulseekBridgeHost {
+                            Task { await soulseek.setManualBridgeHost(draftSoulseekHost) }
+                        }
                         folderID = trimmedFolder
                         dismiss()
                         if changed {
@@ -1369,6 +1427,7 @@ private struct SettingsView: View {
             .onAppear {
                 draftFolderID = folderID
                 draftPeerHost = syncManager.peerHost
+                draftSoulseekHost = syncManager.soulseekBridgeHost
             }
         }
     }

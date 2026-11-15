@@ -66,6 +66,9 @@ class AuthManager private constructor(private val appContext: Context) {
     private val _hasAppDataScope = MutableStateFlow(storedHasAppDataScope())
     val hasAppDataScope: StateFlow<Boolean> = _hasAppDataScope.asStateFlow()
 
+    private val _hasDriveWriteScope = MutableStateFlow(storedHasDriveWriteScope())
+    val hasDriveWriteScope: StateFlow<Boolean> = _hasDriveWriteScope.asStateFlow()
+
     private val _showInAppAuthWebView = MutableStateFlow(false)
     val showInAppAuthWebView: StateFlow<Boolean> = _showInAppAuthWebView.asStateFlow()
 
@@ -73,6 +76,8 @@ class AuthManager private constructor(private val appContext: Context) {
 
     private val _companionUrl = MutableStateFlow("http://${detectLocalIpAddress()}:$COMPANION_PORT")
     val companionUrl: StateFlow<String> = _companionUrl.asStateFlow()
+
+    fun currentRefreshToken(): String? = prefs.getString(KEY_REFRESH_TOKEN, null)
 
     private fun hasStoredAuth(): Boolean {
         val access = prefs.getString(KEY_ACCESS_TOKEN, null)
@@ -85,9 +90,15 @@ class AuthManager private constructor(private val appContext: Context) {
         return scopes.split(Regex("\\s+")).any { it == APPDATA_SCOPE || it.endsWith("/drive.appdata") }
     }
 
+    private fun storedHasDriveWriteScope(): Boolean {
+        val scopes = prefs.getString(KEY_GRANTED_SCOPES, "").orEmpty()
+        return scopes.split(Regex("\\s+")).any { it == DRIVE_WRITE_SCOPE || it.endsWith("/auth/drive") }
+    }
+
     fun markAppDataScopeRevoked() {
         prefs.edit().remove(KEY_GRANTED_SCOPES).apply()
         _hasAppDataScope.value = false
+        _hasDriveWriteScope.value = false
     }
 
     fun startCompanionServer() {
@@ -519,6 +530,7 @@ class AuthManager private constructor(private val appContext: Context) {
             .apply()
         _isAuthenticated.value = false
         _hasAppDataScope.value = false
+        _hasDriveWriteScope.value = false
         _authError.value = null
         SyncManager.getInstance(appContext).resetCloudStateOnSignOut()
     }
@@ -577,6 +589,7 @@ class AuthManager private constructor(private val appContext: Context) {
         }
         if (scopeStr.isNotBlank()) {
             _hasAppDataScope.value = storedHasAppDataScope()
+            _hasDriveWriteScope.value = storedHasDriveWriteScope()
         }
     }
 
@@ -597,7 +610,8 @@ class AuthManager private constructor(private val appContext: Context) {
         const val REDIRECT_SCHEME = "com.googleusercontent.apps.134960325804-ohug3donf2m9l58oj794tah7f0il4arb"
         const val REDIRECT_URI = "$REDIRECT_SCHEME:/oauthredirect"
         const val APPDATA_SCOPE = "https://www.googleapis.com/auth/drive.appdata"
-        const val SCOPE = "https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.appdata"
+        const val DRIVE_WRITE_SCOPE = "https://www.googleapis.com/auth/drive"
+        const val SCOPE = "https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.appdata"
         const val COMPANION_PORT = 8766
 
         private const val KEY_ACCESS_TOKEN = "oauth_access_token"

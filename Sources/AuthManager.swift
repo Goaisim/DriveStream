@@ -11,7 +11,8 @@ final class AuthManager: NSObject, ObservableObject, ASWebAuthenticationPresenta
     static let callbackScheme = "com.googleusercontent.apps.134960325804-ohug3donf2m9l58oj794tah7f0il4arb"
     static let redirectURI = "com.googleusercontent.apps.134960325804-ohug3donf2m9l58oj794tah7f0il4arb:/oauthredirect"
     static let appDataScope = "https://www.googleapis.com/auth/drive.appdata"
-    static let scope = "https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.appdata"
+    static let driveWriteScope = "https://www.googleapis.com/auth/drive"
+    static let scope = "https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.appdata"
 
     private enum Keys {
         static let accessToken = "oauth_access_token"
@@ -23,7 +24,12 @@ final class AuthManager: NSObject, ObservableObject, ASWebAuthenticationPresenta
     @Published private(set) var isAuthenticated = false
     @Published private(set) var isSigningIn = false
     @Published private(set) var hasAppDataScope = false
+    @Published private(set) var hasDriveWriteScope = false
     @Published var authError: String?
+
+    var currentRefreshToken: String? {
+        UserDefaults.standard.string(forKey: Keys.refreshToken)
+    }
 
     private var activeSession: ASWebAuthenticationSession?
     private var refreshTask: Task<String, Error>?
@@ -34,6 +40,7 @@ final class AuthManager: NSObject, ObservableObject, ASWebAuthenticationPresenta
         let hasRefresh = UserDefaults.standard.string(forKey: Keys.refreshToken) != nil
         isAuthenticated = hasToken || hasRefresh
         hasAppDataScope = Self.storedHasAppDataScope()
+        hasDriveWriteScope = Self.storedHasDriveWriteScope()
     }
 
     func signIn() async {
@@ -100,6 +107,7 @@ final class AuthManager: NSObject, ObservableObject, ASWebAuthenticationPresenta
         UserDefaults.standard.removeObject(forKey: Keys.grantedScopes)
         isAuthenticated = false
         hasAppDataScope = false
+        hasDriveWriteScope = false
         authError = nil
         SyncManager.shared.resetCloudStateOnSignOut()
     }
@@ -225,6 +233,7 @@ final class AuthManager: NSObject, ObservableObject, ASWebAuthenticationPresenta
         if let scope = response.scope, !scope.isEmpty {
             UserDefaults.standard.set(scope, forKey: Keys.grantedScopes)
             hasAppDataScope = Self.containsAppDataScope(scope)
+            hasDriveWriteScope = Self.containsDriveWriteScope(scope)
         }
     }
 
@@ -232,10 +241,21 @@ final class AuthManager: NSObject, ObservableObject, ASWebAuthenticationPresenta
         containsAppDataScope(UserDefaults.standard.string(forKey: Keys.grantedScopes))
     }
 
+    private static func storedHasDriveWriteScope() -> Bool {
+        containsDriveWriteScope(UserDefaults.standard.string(forKey: Keys.grantedScopes))
+    }
+
     private static func containsAppDataScope(_ scopeString: String?) -> Bool {
         guard let scopeString else { return false }
         return scopeString.split(whereSeparator: \.isWhitespace).contains { token in
             token == appDataScope || token.hasSuffix("/drive.appdata")
+        }
+    }
+
+    private static func containsDriveWriteScope(_ scopeString: String?) -> Bool {
+        guard let scopeString else { return false }
+        return scopeString.split(whereSeparator: \.isWhitespace).contains { token in
+            token == driveWriteScope || token.hasSuffix("/auth/drive")
         }
     }
 

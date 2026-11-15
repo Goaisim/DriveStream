@@ -37,7 +37,9 @@ data class DriveStreamSyncState(
     val savedLinks: List<SyncedSavedLink> = emptyList(),
     val deletedLinkIds: Map<String, Double> = emptyMap(),
     val watchProgress: Map<String, WatchProgressEntry> = emptyMap(),
-    val customCovers: Map<String, CustomCoverMatch> = emptyMap()
+    val customCovers: Map<String, CustomCoverMatch> = emptyMap(),
+    val soulseekBridgeHost: String = "",
+    val soulseekBridgeUpdatedAt: Double = 0.0
 ) {
     data class SyncedSavedLink(
         val id: String,
@@ -69,7 +71,7 @@ class SyncManager private constructor(private val appContext: Context) {
         .readTimeout(5000, TimeUnit.MILLISECONDS)
         .build()
 
-    private val scanClient = OkHttpClient.Builder()
+    internal val scanClient = OkHttpClient.Builder()
         .connectTimeout(500, TimeUnit.MILLISECONDS)
         .readTimeout(750, TimeUnit.MILLISECONDS)
         .callTimeout(950, TimeUnit.MILLISECONDS)
@@ -77,6 +79,15 @@ class SyncManager private constructor(private val appContext: Context) {
 
     private val _peerHost = MutableStateFlow(cleanHost(prefs.getString(KEY_PEER_HOST, "").orEmpty()))
     val peerHost: StateFlow<String> = _peerHost.asStateFlow()
+
+    private val _soulseekBridgeHost = MutableStateFlow(
+        cleanHost(prefs.getString(KEY_SOULSEEK_BRIDGE_HOST, "").orEmpty())
+    )
+    val soulseekBridgeHost: StateFlow<String> = _soulseekBridgeHost.asStateFlow()
+
+    @Volatile
+    private var soulseekBridgeUpdatedAt: Double =
+        prefs.getString(KEY_SOULSEEK_BRIDGE_UPDATED_AT, null)?.toDoubleOrNull() ?: 0.0
 
     private val _isSyncing = MutableStateFlow(false)
     val isSyncing: StateFlow<Boolean> = _isSyncing.asStateFlow()
@@ -100,6 +111,18 @@ class SyncManager private constructor(private val appContext: Context) {
         val cleaned = cleanHost(rawHost)
         _peerHost.value = cleaned
         prefs.edit().putString(KEY_PEER_HOST, cleaned).apply()
+    }
+
+    fun setSoulseekBridgeHost(rawHost: String) {
+        val cleaned = cleanHost(rawHost)
+        val nowSec = System.currentTimeMillis() / 1000.0
+        _soulseekBridgeHost.value = cleaned
+        soulseekBridgeUpdatedAt = nowSec
+        prefs.edit()
+            .putString(KEY_SOULSEEK_BRIDGE_HOST, cleaned)
+            .putString(KEY_SOULSEEK_BRIDGE_UPDATED_AT, nowSec.toString())
+            .apply()
+        scheduleSyncAfterChange()
     }
 
     fun resetCloudStateOnSignOut() {
@@ -237,13 +260,24 @@ class SyncManager private constructor(private val appContext: Context) {
             savedLinks = syncedLinks,
             deletedLinkIds = deletedSec,
             watchProgress = watchProgress,
-            customCovers = customCovers
+            customCovers = customCovers,
+            soulseekBridgeHost = _soulseekBridgeHost.value,
+            soulseekBridgeUpdatedAt = soulseekBridgeUpdatedAt
         )
     }
 
     private suspend fun applyMergedState(merged: DriveStreamSyncState) {
         isApplyingRemote = true
         try {
+            val cleanedBridgeHost = cleanHost(merged.soulseekBridgeHost)
+            if (cleanedBridgeHost != _soulseekBridgeHost.value || merged.soulseekBridgeUpdatedAt > soulseekBridgeUpdatedAt) {
+                _soulseekBridgeHost.value = cleanedBridgeHost
+                soulseekBridgeUpdatedAt = maxOf(soulseekBridgeUpdatedAt, merged.soulseekBridgeUpdatedAt)
+                prefs.edit()
+                    .putString(KEY_SOULSEEK_BRIDGE_HOST, cleanedBridgeHost)
+                    .putString(KEY_SOULSEEK_BRIDGE_UPDATED_AT, soulseekBridgeUpdatedAt.toString())
+                    .apply()
+            }
             val linksMgr = SavedLinksManager.getInstance(appContext)
             val playbackStore = PlaybackStore.getInstance(appContext)
             val metadataService = MetadataService.getInstance(appContext)
@@ -589,12 +623,21 @@ class SyncManager private constructor(private val appContext: Context) {
                 }
             }
 
+            val localBridge = cleanHost(local.soulseekBridgeHost)
+            val remoteBridge = cleanHost(remote.soulseekBridgeHost)
+            val useRemoteBridge = remote.soulseekBridgeUpdatedAt > local.soulseekBridgeUpdatedAt ||
+                (remote.soulseekBridgeUpdatedAt == local.soulseekBridgeUpdatedAt && localBridge.isBlank() && remoteBridge.isNotBlank())
+            val mergedBridgeHost = if (useRemoteBridge) remoteBridge else localBridge
+            val mergedBridgeUpdatedAt = if (useRemoteBridge) remote.soulseekBridgeUpdatedAt else local.soulseekBridgeUpdatedAt
+
             return DriveStreamSyncState(
                 version = 1,
                 savedLinks = sortedLinks,
                 deletedLinkIds = mergedDeleted,
                 watchProgress = mergedProgress,
-                customCovers = mergedCovers
+                customCovers = mergedCovers,
+                soulseekBridgeHost = mergedBridgeHost,
+                soulseekBridgeUpdatedAt = mergedBridgeUpdatedAt
             )
         }
 
@@ -646,6 +689,8 @@ class SyncManager private constructor(private val appContext: Context) {
                 )
             }
             root.put("customCovers", coversObj)
+            root.put("soulseekBridgeHost", state.soulseekBridgeHost)
+            root.put("soulseekBridgeUpdatedAt", state.soulseekBridgeUpdatedAt)
 
             return root.toString()
         }
@@ -736,17 +781,27 @@ class SyncManager private constructor(private val appContext: Context) {
                     }
                 }
 
+                val soulseekBridgeHost = cleanHost(root.optString("soulseekBridgeHost", ""))
+                val soulseekBridgeUpdatedAt = root.optDouble("soulseekBridgeUpdatedAt", 0.0).let {
+                    if (it.isNaN()) 0.0 else it
+                }
+
                 DriveStreamSyncState(
                     version = version,
                     savedLinks = savedLinks,
                     deletedLinkIds = deletedLinkIds,
                     watchProgress = watchProgress,
-                    customCovers = customCovers
+                    customCovers = customCovers,
+                    soulseekBridgeHost = soulseekBridgeHost,
+                    soulseekBridgeUpdatedAt = soulseekBridgeUpdatedAt
                 )
             }.getOrNull()
         }
 
-        private fun cleanHost(raw: String): String {
+        private const val KEY_SOULSEEK_BRIDGE_HOST = "soulseek_bridge_host"
+        private const val KEY_SOULSEEK_BRIDGE_UPDATED_AT = "soulseek_bridge_updated_at"
+
+        fun cleanHost(raw: String): String {
             var text = raw.trim()
             if (text.lowercase().startsWith("http://")) text = text.drop(7)
             else if (text.lowercase().startsWith("https://")) text = text.drop(8)

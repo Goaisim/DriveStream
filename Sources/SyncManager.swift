@@ -21,6 +21,8 @@ struct DriveStreamSyncState: Codable, Equatable {
     var deletedLinkIds: [String: Double] = [:]
     var watchProgress: [String: WatchProgressEntry] = [:]
     var customCovers: [String: CustomCoverMatch] = [:]
+    var soulseekBridgeHost: String = ""
+    var soulseekBridgeUpdatedAt: Double = 0
 
     enum CodingKeys: String, CodingKey {
         case version
@@ -28,6 +30,8 @@ struct DriveStreamSyncState: Codable, Equatable {
         case deletedLinkIds
         case watchProgress
         case customCovers
+        case soulseekBridgeHost
+        case soulseekBridgeUpdatedAt
     }
 
     init(
@@ -35,13 +39,17 @@ struct DriveStreamSyncState: Codable, Equatable {
         savedLinks: [SyncedSavedLink] = [],
         deletedLinkIds: [String: Double] = [:],
         watchProgress: [String: WatchProgressEntry] = [:],
-        customCovers: [String: CustomCoverMatch] = [:]
+        customCovers: [String: CustomCoverMatch] = [:],
+        soulseekBridgeHost: String = "",
+        soulseekBridgeUpdatedAt: Double = 0
     ) {
         self.version = version
         self.savedLinks = savedLinks
         self.deletedLinkIds = deletedLinkIds
         self.watchProgress = watchProgress
         self.customCovers = customCovers
+        self.soulseekBridgeHost = soulseekBridgeHost
+        self.soulseekBridgeUpdatedAt = soulseekBridgeUpdatedAt
     }
 
     init(from decoder: Decoder) throws {
@@ -51,6 +59,10 @@ struct DriveStreamSyncState: Codable, Equatable {
         deletedLinkIds = try container.decodeIfPresent([String: Double].self, forKey: .deletedLinkIds) ?? [:]
         watchProgress = try container.decodeIfPresent([String: WatchProgressEntry].self, forKey: .watchProgress) ?? [:]
         customCovers = try container.decodeIfPresent([String: CustomCoverMatch].self, forKey: .customCovers) ?? [:]
+        soulseekBridgeHost = Self.cleanHost(
+            try container.decodeIfPresent(String.self, forKey: .soulseekBridgeHost) ?? ""
+        )
+        soulseekBridgeUpdatedAt = try container.decodeIfPresent(Double.self, forKey: .soulseekBridgeUpdatedAt) ?? 0
     }
 }
 
@@ -63,6 +75,8 @@ final class SyncManager: ObservableObject {
 
     private enum Keys {
         static let peerHost = "peer_sync_host"
+        static let soulseekBridgeHost = "soulseek_bridge_host"
+        static let soulseekBridgeUpdatedAt = "soulseek_bridge_updated_at"
     }
 
     @Published var peerHost: String {
@@ -75,6 +89,9 @@ final class SyncManager: ObservableObject {
             UserDefaults.standard.set(trimmed, forKey: Keys.peerHost)
         }
     }
+
+    @Published private(set) var soulseekBridgeHost: String
+    private var soulseekBridgeUpdatedAt: Double
 
     @Published private(set) var isSyncing = false
     @Published private(set) var isScanning = false
@@ -96,6 +113,10 @@ final class SyncManager: ObservableObject {
         let savedHost = UserDefaults.standard.string(forKey: Keys.peerHost) ?? ""
         self.peerHost = Self.cleanHost(savedHost)
 
+        let savedBridgeHost = UserDefaults.standard.string(forKey: Keys.soulseekBridgeHost) ?? ""
+        self.soulseekBridgeHost = Self.cleanHost(savedBridgeHost)
+        self.soulseekBridgeUpdatedAt = UserDefaults.standard.double(forKey: Keys.soulseekBridgeUpdatedAt)
+
         let cloudConfig = URLSessionConfiguration.ephemeral
         cloudConfig.timeoutIntervalForRequest = 15
         cloudConfig.timeoutIntervalForResource = 25
@@ -105,6 +126,16 @@ final class SyncManager: ObservableObject {
         peerConfig.timeoutIntervalForRequest = 3.5
         peerConfig.timeoutIntervalForResource = 5.0
         self.peerSession = URLSession(configuration: peerConfig)
+    }
+
+    func setSoulseekBridgeHost(_ rawHost: String) {
+        let cleaned = Self.cleanHost(rawHost)
+        let now = Date().timeIntervalSince1970
+        soulseekBridgeHost = cleaned
+        soulseekBridgeUpdatedAt = now
+        UserDefaults.standard.set(cleaned, forKey: Keys.soulseekBridgeHost)
+        UserDefaults.standard.set(now, forKey: Keys.soulseekBridgeUpdatedAt)
+        scheduleSyncAfterChange()
     }
 
     func resetCloudStateOnSignOut() {
@@ -226,13 +257,23 @@ final class SyncManager: ObservableObject {
             savedLinks: syncedLinks,
             deletedLinkIds: linksManager.deletedTombstones,
             watchProgress: syncedProgress,
-            customCovers: covers
+            customCovers: covers,
+            soulseekBridgeHost: soulseekBridgeHost,
+            soulseekBridgeUpdatedAt: soulseekBridgeUpdatedAt
         )
     }
 
     func applyMergedState(_ merged: DriveStreamSyncState) async {
         isApplyingRemote = true
         defer { isApplyingRemote = false }
+
+        let cleanedBridgeHost = Self.cleanHost(merged.soulseekBridgeHost)
+        if cleanedBridgeHost != soulseekBridgeHost || merged.soulseekBridgeUpdatedAt > soulseekBridgeUpdatedAt {
+            soulseekBridgeHost = cleanedBridgeHost
+            soulseekBridgeUpdatedAt = max(soulseekBridgeUpdatedAt, merged.soulseekBridgeUpdatedAt)
+            UserDefaults.standard.set(cleanedBridgeHost, forKey: Keys.soulseekBridgeHost)
+            UserDefaults.standard.set(soulseekBridgeUpdatedAt, forKey: Keys.soulseekBridgeUpdatedAt)
+        }
 
         let convertedLinks = merged.savedLinks.map { item in
             SavedLink(
@@ -348,12 +389,27 @@ final class SyncManager: ObservableObject {
             }
         }
 
+        let localBridge = Self.cleanHost(local.soulseekBridgeHost)
+        let remoteBridge = Self.cleanHost(remote.soulseekBridgeHost)
+        let mergedBridgeHost: String
+        let mergedBridgeUpdatedAt: Double
+        if remote.soulseekBridgeUpdatedAt > local.soulseekBridgeUpdatedAt ||
+            (remote.soulseekBridgeUpdatedAt == local.soulseekBridgeUpdatedAt && localBridge.isEmpty && !remoteBridge.isEmpty) {
+            mergedBridgeHost = remoteBridge
+            mergedBridgeUpdatedAt = remote.soulseekBridgeUpdatedAt
+        } else {
+            mergedBridgeHost = localBridge
+            mergedBridgeUpdatedAt = local.soulseekBridgeUpdatedAt
+        }
+
         return DriveStreamSyncState(
             version: 1,
             savedLinks: sortedLinks,
             deletedLinkIds: mergedDeleted,
             watchProgress: mergedProgress,
-            customCovers: mergedCovers
+            customCovers: mergedCovers,
+            soulseekBridgeHost: mergedBridgeHost,
+            soulseekBridgeUpdatedAt: mergedBridgeUpdatedAt
         )
     }
 
@@ -610,7 +666,7 @@ final class SyncManager: ObservableObject {
         case httpFailure(Int)
     }
 
-    private static func cleanHost(_ raw: String) -> String {
+    nonisolated static func cleanHost(_ raw: String) -> String {
         var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if text.lowercased().hasPrefix("http://") {
             text = String(text.dropFirst(7))
@@ -658,7 +714,7 @@ final class SyncManager: ObservableObject {
         ))
     }
 
-    nonisolated private static func detectLocalIPv4() -> String? {
+    nonisolated static func detectLocalIPv4() -> String? {
         var ifaddr: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return nil }
         defer { freeifaddrs(ifaddr) }
