@@ -23,7 +23,7 @@ $BridgeScript = Join-Path $BridgeDir "drive_uploader_bridge.py"
 $SlskdExe = Join-Path $BinDir "slskd.exe"
 
 $SlskdApiKey = "drivestream-slskd-key-2026"
-$DefaultDriveFolderId = "89VXpiNB2PxwnR__gNUwAuwU2wnsT1ME"
+$DefaultDriveFolderId = "189VXpiNB2PxwnR__gNUwAuwU2wnsT1ME"
 
 New-Item -ItemType Directory -Force -Path $BinDir, $DownloadsDir, $IncompleteDir, $SharedDir | Out-Null
 

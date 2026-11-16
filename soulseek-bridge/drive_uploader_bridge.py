@@ -36,8 +36,8 @@ STATE_FILE = BRIDGE_DIR / ".bridge_state.json"
 SLSKD_URL = os.environ.get("SLSKD_URL", "http://127.0.0.1:5030").rstrip("/")
 SLSKD_API_KEY = os.environ.get("SLSKD_API_KEY", "drivestream-slskd-key-2026")
 DEFAULT_TARGET_FOLDER_ID = (
-    os.environ.get("DRIVE_TARGET_FOLDER_ID", "89VXpiNB2PxwnR__gNUwAuwU2wnsT1ME").strip()
-    or "89VXpiNB2PxwnR__gNUwAuwU2wnsT1ME"
+    os.environ.get("DRIVE_TARGET_FOLDER_ID", "189VXpiNB2PxwnR__gNUwAuwU2wnsT1ME").strip()
+    or "189VXpiNB2PxwnR__gNUwAuwU2wnsT1ME"
 )
 BRIDGE_PORT = int(os.environ.get("BRIDGE_PORT", "5031"))
 GOOGLE_CLIENT_ID = "134960325804-ohug3donf2m9l58oj794tah7f0il4arb.apps.googleusercontent.com"
