@@ -20,8 +20,11 @@ build/
 
 # Soulseek Bridge runtime files (keep scripts tracked)
 soulseek-bridge/bin/
+soulseek-bridge/data/
 soulseek-bridge/downloads/
 soulseek-bridge/incomplete/
+soulseek-bridge/shared/
+soulseek-bridge/scripts/
 soulseek-bridge/logs/
 soulseek-bridge/.env
 soulseek-bridge/.bridge_state.json

@@ -15,10 +15,13 @@ from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import ipaddress
 import json
 import mimetypes
 import os
 import re
+import socket
+import subprocess
 import sys
 import threading
 import time
@@ -52,6 +55,133 @@ RELEASE_NOISE_RE = re.compile(
 SEASON_DIR_RE = re.compile(r"^(?:season|series|s)\s*0*(\d{1,2})\b", re.IGNORECASE)
 EPISODE_SXE_RE = re.compile(r"\bS(\d{1,2})[\s._-]*E(\d{1,3})\b", re.IGNORECASE)
 EPISODE_X_RE = re.compile(r"\b(\d{1,2})x(\d{1,3})\b", re.IGNORECASE)
+VIRTUAL_IFACE_RE = re.compile(
+    r"(vethernet|wsl|docker|hyper-v|vmware|virtualbox|loopback|radmin|vpn|"
+    r"tailscale|zerotier|wireguard|openvpn|teredo|hamachi|tunnel|bluetooth)",
+    re.IGNORECASE,
+)
+IPV4_VALUE_RE = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3})")
+
+_LAN_IP_CACHE_LOCK = threading.Lock()
+_LAN_IP_CACHE: tuple[float, str] = (0.0, "")
+
+
+def is_usable_lan_ipv4(ip: str) -> bool:
+    try:
+        addr = ipaddress.IPv4Address(ip.strip())
+    except ValueError:
+        return False
+    if addr.is_loopback or addr.is_link_local or addr.is_unspecified or addr.is_multicast:
+        return False
+    # Exclude Docker / WSL / Hyper-V default 172.16.0.0/12 virtual NAT ranges
+    if addr in ipaddress.IPv4Network("172.16.0.0/12"):
+        return False
+    return True
+
+
+def parse_windows_ipconfig_lan_ip(output: str) -> str | None:
+    """Select real hardware adapter IPv4 that has an IPv4 Default Gateway."""
+    current_header = ""
+    current_ips: list[str] = []
+    has_gateway = False
+    preferred_192: list[str] = []
+    preferred_10: list[str] = []
+
+    def flush_section() -> None:
+        if not current_header or VIRTUAL_IFACE_RE.search(current_header):
+            return
+        if not has_gateway:
+            return
+        for ip in current_ips:
+            if not is_usable_lan_ipv4(ip):
+                continue
+            if ip.startswith("192.168."):
+                preferred_192.append(ip)
+            elif ip.startswith("10."):
+                preferred_10.append(ip)
+
+    for raw_line in output.splitlines():
+        if raw_line and not raw_line.startswith((" ", "\t")) and ":" in raw_line:
+            flush_section()
+            current_header = raw_line.strip()
+            current_ips = []
+            has_gateway = False
+            continue
+
+        line = raw_line.strip()
+        if not line:
+            continue
+        lower = line.lower()
+        if "ipv4" in lower and ":" in line:
+            match = IPV4_VALUE_RE.search(line.split(":", 1)[1])
+            if match:
+                current_ips.append(match.group(1))
+        elif "default gateway" in lower and ":" in line:
+            gw_part = line.split(":", 1)[1].strip()
+            if gw_part and IPV4_VALUE_RE.search(gw_part):
+                has_gateway = True
+        elif has_gateway is False and current_ips and re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", line):
+            # Continuation line under Default Gateway (IPv4 following IPv6 gateway)
+            has_gateway = True
+
+    flush_section()
+    if preferred_192:
+        return preferred_192[0]
+    if preferred_10:
+        return preferred_10[0]
+    return None
+
+
+def detect_primary_lan_ip() -> str:
+    env_host = os.environ.get("BRIDGE_HOST", "").strip()
+    if env_host and is_usable_lan_ipv4(env_host):
+        return env_host
+
+    if os.name == "nt":
+        try:
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            out = subprocess.check_output(
+                ["ipconfig"],
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=3.0,
+                creationflags=creation_flags,
+            )
+            parsed = parse_windows_ipconfig_lan_ip(out)
+            if parsed:
+                return parsed
+        except Exception:
+            pass
+
+    for probe_target in ("192.168.1.1", "192.168.0.1", "8.8.8.8"):
+        sock: socket.socket | None = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(0.5)
+            sock.connect((probe_target, 80))
+            ip = sock.getsockname()[0]
+            if is_usable_lan_ipv4(ip) and (ip.startswith("192.168.") or ip.startswith("10.")):
+                return ip
+        except OSError:
+            pass
+        finally:
+            if sock is not None:
+                sock.close()
+
+    return "127.0.0.1"
+
+
+def get_cached_lan_ip() -> str:
+    now = time.monotonic()
+    with _LAN_IP_CACHE_LOCK:
+        ts, cached = _LAN_IP_CACHE
+        if cached and (now - ts) < 30.0:
+            return cached
+    detected = detect_primary_lan_ip()
+    with _LAN_IP_CACHE_LOCK:
+        globals()["_LAN_IP_CACHE"] = (now, detected)
+    return detected
 
 
 def normalize_sep(path: str) -> str:
@@ -192,8 +322,17 @@ class BridgeCoordinator:
         # Keyed by transfer_key = f"{username}::{filename}"
         self.jobs: dict[str, dict[str, object]] = {}
         self.completed_uploads_count = 0
+        self.slskd_ready = False
         self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="drive-upload")
         self._load_state()
+
+    def refresh_slskd_ready(self) -> bool:
+        try:
+            self.slskd.request("GET", "/api/v0/application", timeout=1.5)
+            self.slskd_ready = True
+        except Exception:
+            self.slskd_ready = False
+        return self.slskd_ready
 
     @staticmethod
     def job_key(username: str, filename: str) -> str:
@@ -939,15 +1078,40 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return
         super().log_message(fmt, *args)
 
+    def _send_cors_headers(self) -> None:
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-API-Key, Authorization")
+
     def _send_json(self, status: int, payload: object) -> None:
         data = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self._send_cors_headers()
         self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(data)
+
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self._send_cors_headers()
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    @staticmethod
+    def _health_payload() -> dict[str, object]:
+        return {
+            "status": "ok",
+            "ok": True,
+            "service": "drivestream-soulseek-bridge",
+            "version": 1,
+            "slskdReady": COORDINATOR.slskd_ready,
+            "host": get_cached_lan_ip(),
+            "port": BRIDGE_PORT,
+        }
 
     def _read_json_body(self) -> dict[str, object]:
         length = int(self.headers.get("Content-Length", "0") or 0)
@@ -962,11 +1126,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
         path = parsed.path
 
         try:
-            if path == "/api/health":
-                self._send_json(
-                    HTTPStatus.OK,
-                    {"ok": True, "service": "drivestream-soulseek-bridge", "version": 1},
-                )
+            if path in ("/", "/health", "/api/health", "/api/status"):
+                self._send_json(HTTPStatus.OK, self._health_payload())
                 return
 
             if path == "/api/transfers":
@@ -1013,6 +1174,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
 def start_watcher(stop_event: threading.Event) -> None:
     def loop() -> None:
         while not stop_event.is_set():
+            COORDINATOR.refresh_slskd_ready()
             COORDINATOR.poll_and_dispatch_uploads()
             stop_event.wait(POLL_INTERVAL_SECONDS)
 
@@ -1022,12 +1184,13 @@ def start_watcher(stop_event: threading.Event) -> None:
 
 def main() -> None:
     DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    lan_ip = get_cached_lan_ip()
     stop_event = threading.Event()
     start_watcher(stop_event)
 
     ThreadingHTTPServer.allow_reuse_address = True
     server = ThreadingHTTPServer(("0.0.0.0", BRIDGE_PORT), BridgeHandler)
-    print(f"[Bridge] Listening on http://0.0.0.0:{BRIDGE_PORT} -> slskd {SLSKD_URL}")
+    print(f"[Bridge] Listening on http://0.0.0.0:{BRIDGE_PORT} (LAN http://{lan_ip}:{BRIDGE_PORT}) -> slskd {SLSKD_URL}")
     print(f"[Bridge] Default Google Drive target folder: {DEFAULT_TARGET_FOLDER_ID}")
     try:
         server.serve_forever()

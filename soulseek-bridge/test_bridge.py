@@ -73,8 +73,44 @@ def test_find_downloaded_file() -> None:
             assert found == ep
 
 
+def test_lan_ip_detection() -> None:
+    assert not bridge.is_usable_lan_ipv4("172.20.96.1")
+    assert not bridge.is_usable_lan_ipv4("169.254.154.173")
+    assert not bridge.is_usable_lan_ipv4("127.0.0.1")
+    assert bridge.is_usable_lan_ipv4("192.168.1.42")
+
+    sample_ipconfig = """
+Windows IP Configuration
+
+Ethernet adapter Ethernet:
+   Connection-specific DNS Suffix  . : home
+   IPv4 Address. . . . . . . . . . . : 192.168.1.42(Preferred)
+   Subnet Mask . . . . . . . . . . . : 255.255.255.0
+   Default Gateway . . . . . . . . . : 192.168.1.1
+
+Ethernet adapter vEthernet (Default Switch):
+   IPv4 Address. . . . . . . . . . . : 172.20.96.1(Preferred)
+   Default Gateway . . . . . . . . . :
+
+Ethernet adapter Radmin VPN:
+   IPv4 Address. . . . . . . . . . . : 26.249.209.14(Preferred)
+   Default Gateway . . . . . . . . . : 26.0.0.1
+
+Wireless LAN adapter Wi-Fi 2:
+   Autoconfiguration IPv4 Address. . : 169.254.154.173(Preferred)
+   Default Gateway . . . . . . . . . :
+"""
+    assert bridge.parse_windows_ipconfig_lan_ip(sample_ipconfig) == "192.168.1.42"
+    payload = bridge.BridgeHandler._health_payload()
+    assert payload["status"] == "ok" and payload["ok"] is True
+    assert payload["service"] == "drivestream-soulseek-bridge"
+    assert payload["port"] == bridge.BRIDGE_PORT
+    assert isinstance(payload["slskdReady"], bool)
+
+
 if __name__ == "__main__":
     test_parse_media_target()
     test_search_filtering_and_sorting()
     test_find_downloaded_file()
+    test_lan_ip_detection()
     print("All soulseek-bridge self-tests passed!")
