@@ -1431,7 +1431,7 @@ private struct SettingsView: View {
                                             .foregroundStyle(.primary)
                                         Text(tv.signedIn ? "Already signed in" : "Waiting for login push")
                                             .font(.caption)
-                                            .foregroundStyle(tv.signedIn ? .green : .secondary)
+                                            .foregroundStyle(tv.signedIn ? Color.green : Color.secondary)
                                     }
                                     Spacer()
                                     if draftTVHost == tv.ip {
@@ -1513,7 +1513,7 @@ private struct SettingsView: View {
                 Section("Account") {
                     Text(authManager.tokenDiagnostics)
                         .font(.caption)
-                        .foregroundStyle(authManager.lastRefreshError == nil ? .secondary : .orange)
+                        .foregroundStyle(authManager.lastRefreshError == nil ? Color.secondary : Color.orange)
                         .textSelection(.enabled)
 
                     if authManager.isAuthenticated {
