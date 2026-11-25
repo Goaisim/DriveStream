@@ -16,6 +16,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
 struct DriveStreamApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var authManager = AuthManager.shared
+    @Environment(\.scenePhase) private var scenePhase
 
     init() {
         UserDefaults.standard.register(defaults: [
@@ -28,8 +29,14 @@ struct DriveStreamApp: App {
             ContentView()
                 .environmentObject(authManager)
                 .preferredColorScheme(.dark)
-                .onAppear {
+                .task {
                     LocalStreamProxy.shared.start()
+                    await authManager.refreshIfNeededOnWake()
+                }
+                .onChange(of: scenePhase) { _, phase in
+                    if phase == .active {
+                        Task { await authManager.refreshIfNeededOnWake() }
+                    }
                 }
         }
     }

@@ -15,7 +15,10 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        AuthManager.getInstance(this).startCompanionServer()
+        AuthManager.getInstance(this).apply {
+            startCompanionServer()
+            refreshIfNeededOnWakeAsync()
+        }
         LocalStreamProxy.getInstance(this).start()
         AndroidAdBlockEngine.getInstance(this).prepare()
         SyncManager.getInstance(this).syncOnLaunch()
@@ -35,6 +38,15 @@ class MainActivity : ComponentActivity() {
             ) {
                 TvMainScreen()
             }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        AuthManager.getInstance(this).apply {
+            startCompanionServer()
+            refreshLocalIp()
+            refreshIfNeededOnWakeAsync()
         }
     }
 

@@ -320,7 +320,8 @@ fun TvMainScreen(libraryViewModel: LibraryViewModel = viewModel()) {
     val isAuthenticated by authManager.isAuthenticated.collectAsState()
     val hasAppDataScope by authManager.hasAppDataScope.collectAsState()
     val companionUrl by authManager.companionUrl.collectAsState()
-    val showInAppAuthWebView by authManager.showInAppAuthWebView.collectAsState()
+    val tokenDiagnostics by authManager.tokenDiagnostics.collectAsState()
+    val lastRefreshError by authManager.lastRefreshError.collectAsState()
     val savedLinks by linksManager.links.collectAsState()
     val folderId by driveSettings.folderId.collectAsState()
     val coversRevision by syncManager.coversRevision.collectAsState()
@@ -447,9 +448,9 @@ fun TvMainScreen(libraryViewModel: LibraryViewModel = viewModel()) {
                             if (isAuthenticated) libraryViewModel.loadLibrary(folderId)
                         },
                         onSignIn = { authManager.launchTvBrowserSignIn(context) },
-                        onSignInBuiltIn = { authManager.openInAppSignIn() },
                         onOpenSettings = {
                             authManager.refreshLocalIp()
+                            authManager.refreshDiagnostics()
                             showSettingsDialog = true
                         },
                         onOpenSoulseek = {
@@ -543,6 +544,8 @@ fun TvMainScreen(libraryViewModel: LibraryViewModel = viewModel()) {
                 isAuthenticated = isAuthenticated,
                 hasAppDataScope = hasAppDataScope,
                 companionUrl = companionUrl,
+                tokenDiagnostics = tokenDiagnostics,
+                hasRefreshError = !lastRefreshError.isNullOrBlank(),
                 currentFolderId = folderId,
                 syncManager = syncManager,
                 onDismiss = { showSettingsDialog = false },
@@ -574,13 +577,6 @@ fun TvMainScreen(libraryViewModel: LibraryViewModel = viewModel()) {
                 }
             )
         }
-
-        if (showInAppAuthWebView) {
-            InAppOAuthWebViewDialog(
-                authManager = authManager,
-                onDismiss = { authManager.dismissInAppSignIn() }
-            )
-        }
     }
 }
 
@@ -596,11 +592,15 @@ private fun TvSignInScreen(
     val isSigningIn by authManager.isSigningIn.collectAsState()
     val authError by authManager.authError.collectAsState()
     val primaryFocus = remember { FocusRequester() }
+    var cardFocused by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
+        authManager.startCompanionServer()
         delay(60L)
         runCatching { primaryFocus.requestFocus() }
     }
+
+    val hostPortText = companionUrl.removePrefix("http://").removePrefix("https://")
 
     Box(
         modifier = Modifier
@@ -614,13 +614,13 @@ private fun TvSignInScreen(
         contentAlignment = Alignment.Center
     ) {
         Row(
-            modifier = Modifier.fillMaxWidth(0.9f),
-            horizontalArrangement = Arrangement.spacedBy(36.dp),
+            modifier = Modifier.fillMaxWidth(0.92f),
+            horizontalArrangement = Arrangement.spacedBy(32.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Column(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(16.dp)
+                modifier = Modifier.weight(0.92f),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
                 Box(
                     modifier = Modifier
@@ -663,68 +663,88 @@ private fun TvSignInScreen(
 
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     TvActionButton(
-                        label = if (isSigningIn) "Signing In…" else "Sign In Using Built-In Browser (Shield / TV)",
+                        label = "Sign In with System Browser (Fire TV Silk)",
                         icon = Icons.Default.Public,
-                        isPrimary = true,
-                        modifier = Modifier.focusRequester(primaryFocus),
-                        onClick = { authManager.openInAppSignIn() }
+                        onClick = { authManager.launchTvBrowserSignIn(context) }
                     )
 
-                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        TvActionButton(
-                            label = if (isSigningIn) "Signing In…" else "Sign in on TV Browser",
-                            icon = Icons.Default.PlayArrow,
-                            onClick = { authManager.launchTvBrowserSignIn(context) }
-                        )
-
-                        TvActionButton(
-                            label = "Use Web Links Only",
-                            icon = Icons.Default.Tv,
-                            onClick = onContinueLinksOnly
-                        )
-                    }
+                    TvActionButton(
+                        label = "Use Web Links Only",
+                        icon = Icons.Default.Tv,
+                        onClick = onContinueLinksOnly
+                    )
                 }
             }
 
-            // Companion Server Card
+            // Default Highlighted iPhone-to-TV Sign-In Card
             Column(
                 modifier = Modifier
-                    .weight(0.9f)
+                    .weight(1.08f)
                     .clip(RoundedCornerShape(20.dp))
-                    .background(Color(0xFF141621))
-                    .border(1.dp, Color(0xFF2B324D), RoundedCornerShape(20.dp))
+                    .background(if (cardFocused) Color(0xFF1A2542) else Color(0xFF151C32))
+                    .border(
+                        width = if (cardFocused) 3.dp else 2.dp,
+                        color = if (cardFocused) Color.White else Color(0xFF3B82F6),
+                        shape = RoundedCornerShape(20.dp)
+                    )
+                    .focusRequester(primaryFocus)
+                    .onFocusChanged { cardFocused = it.isFocused }
+                    .focusable()
+                    .clickable {
+                        authManager.startCompanionServer()
+                    }
                     .padding(28.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 Text(
-                    text = "Sign In or Add Links from Phone / PC",
-                    color = Color(0xFF93C5FD),
-                    fontSize = 18.sp,
+                    text = "Sign In from iPhone DriveStream (Recommended)",
+                    color = Color.White,
+                    fontSize = 20.sp,
                     fontWeight = FontWeight.Bold
                 )
-                Text(
-                    text = "Open this URL in Safari or any browser on the same Wi-Fi network to complete Google OAuth PKCE or manage Web Links without typing on the TV:",
-                    color = Color(0xFFD1D5DB),
-                    fontSize = 14.sp,
-                    lineHeight = 20.sp
-                )
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    CircularProgressIndicator(
+                        color = Color(0xFF60A5FA),
+                        strokeWidth = 2.5.dp,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Text(
+                        text = if (isSigningIn) "Verifying session from iPhone…" else "Waiting for login push from iPhone...",
+                        color = Color(0xFF93C5FD),
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(12.dp))
                         .background(Color(0xFF0A0B12))
-                        .border(1.dp, Color(0xFF3B82F6).copy(alpha = 0.5f), RoundedCornerShape(12.dp))
+                        .border(1.dp, Color(0xFF3B82F6).copy(alpha = 0.6f), RoundedCornerShape(12.dp))
                         .padding(vertical = 14.dp, horizontal = 16.dp)
                 ) {
                     Text(
-                        text = companionUrl,
+                        text = hostPortText,
                         color = Color.White,
-                        fontSize = 20.sp,
+                        fontSize = 24.sp,
                         fontWeight = FontWeight.Bold
                     )
                 }
+
                 Text(
-                    text = "Listening on 0.0.0.0:${AuthManager.COMPANION_PORT}",
+                    text = "1. Open DriveStream on your iPhone -> Settings -> Sign In My TV.\n2. Tap Scan Wi-Fi (or enter $hostPortText) -> Push Login to TV.\n3. Or open $companionUrl in any browser to paste a Session Code.",
+                    color = Color(0xFFD1D5DB),
+                    fontSize = 13.sp,
+                    lineHeight = 20.sp
+                )
+
+                Text(
+                    text = "Listening on 0.0.0.0:${AuthManager.COMPANION_PORT} • Press OK to refresh IP",
                     color = Color(0xFF9CA3AF),
                     fontSize = 12.sp
                 )
@@ -754,7 +774,6 @@ private fun TvHomeContent(
     onOpenCoverFinder: (ShowGroup) -> Unit,
     onRefresh: () -> Unit,
     onSignIn: () -> Unit,
-    onSignInBuiltIn: () -> Unit,
     onOpenSettings: () -> Unit,
     onOpenSoulseek: () -> Unit
 ) {
@@ -963,24 +982,16 @@ private fun TvHomeContent(
                                     fontWeight = FontWeight.SemiBold
                                 )
                                 Text(
-                                    text = "Sign in to load your Google Drive Shows & Movies below Web Links, or open $companionUrl from your phone or PC.",
+                                    text = "Push login from iPhone DriveStream ($companionUrl) • Waiting for login push from iPhone...",
                                     color = Color(0xFF9CA3AF),
                                     fontSize = 14.sp,
                                     textAlign = TextAlign.Center
                                 )
-                                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                                    TvActionButton(
-                                        label = "Sign In Using Built-In Browser (Shield / TV)",
-                                        icon = Icons.Default.Public,
-                                        isPrimary = true,
-                                        onClick = onSignInBuiltIn
-                                    )
-                                    TvActionButton(
-                                        label = "Sign in on TV Browser",
-                                        icon = Icons.Default.PlayArrow,
-                                        onClick = onSignIn
-                                    )
-                                }
+                                TvActionButton(
+                                    label = "Sign In with System Browser (Fire TV Silk)",
+                                    icon = Icons.Default.Public,
+                                    onClick = onSignIn
+                                )
                             }
                         }
                     }
@@ -1977,6 +1988,8 @@ private fun TvSettingsDialog(
     isAuthenticated: Boolean,
     hasAppDataScope: Boolean,
     companionUrl: String,
+    tokenDiagnostics: String,
+    hasRefreshError: Boolean,
     currentFolderId: String,
     syncManager: SyncManager,
     onDismiss: () -> Unit,
@@ -2016,6 +2029,17 @@ private fun TvSettingsDialog(
                 color = Color(0xFF93C5FD),
                 fontSize = 13.sp,
                 fontWeight = FontWeight.SemiBold
+            )
+
+            Text(
+                text = tokenDiagnostics,
+                color = when {
+                    hasRefreshError -> Color(0xFFFBBF24)
+                    isAuthenticated -> Color(0xFF4ADE80)
+                    else -> Color(0xFF9CA3AF)
+                },
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium
             )
 
             Text(

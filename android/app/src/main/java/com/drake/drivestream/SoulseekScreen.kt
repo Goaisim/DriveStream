@@ -234,18 +234,14 @@ fun SoulseekHubOverlay(
                             fontWeight = FontWeight.Bold
                         )
                         Text(
-                            text = "Reconnect Google Drive so the PC bridge can upload downloads straight into your Drive folder.",
+                            text = "Push Google Drive login from iPhone DriveStream (${authManager.companionUrl.collectAsState().value}) or sign in via System Browser.",
                             color = Color(0xFFE5E7EB),
                             fontSize = 12.sp
                         )
                     }
                     TvActionButton(
-                        label = "Grant Permission (Built-In)",
+                        label = "Sign In with System Browser",
                         isPrimary = true,
-                        onClick = { authManager.openInAppSignIn() }
-                    )
-                    TvActionButton(
-                        label = "Browser",
                         onClick = { authManager.launchTvBrowserSignIn(context) }
                     )
                 }

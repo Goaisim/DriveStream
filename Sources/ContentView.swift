@@ -1,5 +1,6 @@
 import AVFoundation
 import SwiftUI
+import UIKit
 
 // MARK: - View Models & Domain Models
 
@@ -1254,6 +1255,13 @@ private struct SettingsView: View {
     @State private var draftFolderID = ""
     @State private var draftPeerHost = ""
     @State private var draftSoulseekHost = ""
+    @State private var draftTVHost = "192.168.1.181"
+    @State private var discoveredTVs: [DiscoveredTV] = []
+    @State private var isScanningTVs = false
+    @State private var isPushingTVLogin = false
+    @State private var tvPushStatus: String?
+    @State private var tvPushIsError = false
+    @State private var copiedSessionCode = false
     @State private var clearedCache = false
 
     var body: some View {
@@ -1382,7 +1390,132 @@ private struct SettingsView: View {
                     Text("Show covers, episode titles, and summaries are fetched automatically from TVMaze and iTunes with no API key required.")
                 }
 
+                Section {
+                    Button {
+                        Task {
+                            isScanningTVs = true
+                            tvPushStatus = nil
+                            tvPushIsError = false
+                            let found = await authManager.scanForDriveStreamTVs()
+                            discoveredTVs = found
+                            if let first = found.first {
+                                draftTVHost = first.ip
+                            } else {
+                                tvPushStatus = "No DriveStream TV found on port 8766. Enter the TV IP shown on screen."
+                                tvPushIsError = true
+                            }
+                            isScanningTVs = false
+                        }
+                    } label: {
+                        HStack {
+                            Label(
+                                isScanningTVs ? "Scanning Wi-Fi (:8766)…" : "Scan Wi-Fi for DriveStream TV",
+                                systemImage: "tv.and.mediabox"
+                            )
+                            if isScanningTVs {
+                                Spacer()
+                                ProgressView()
+                            }
+                        }
+                    }
+                    .disabled(isScanningTVs || isPushingTVLogin)
+
+                    if !discoveredTVs.isEmpty {
+                        ForEach(discoveredTVs) { tv in
+                            Button {
+                                draftTVHost = tv.ip
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("\(tv.device) (\(tv.ip))")
+                                            .foregroundStyle(.primary)
+                                        Text(tv.signedIn ? "Already signed in" : "Waiting for login push")
+                                            .font(.caption)
+                                            .foregroundStyle(tv.signedIn ? .green : .secondary)
+                                    }
+                                    Spacer()
+                                    if draftTVHost == tv.ip {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .foregroundStyle(.blue)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    TextField("TV IP (e.g. 192.168.1.181)", text: $draftTVHost)
+                        .keyboardType(.numbersAndPunctuation)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+
+                    Button {
+                        Task {
+                            isPushingTVLogin = true
+                            tvPushStatus = nil
+                            tvPushIsError = false
+                            do {
+                                let status = try await authManager.pushLoginToTV(host: draftTVHost)
+                                tvPushStatus = status
+                                tvPushIsError = false
+                            } catch {
+                                tvPushStatus = error.localizedDescription
+                                tvPushIsError = true
+                            }
+                            isPushingTVLogin = false
+                        }
+                    } label: {
+                        HStack {
+                            Label(
+                                isPushingTVLogin ? "Pushing Login to TV…" : "Push Login to TV",
+                                systemImage: "iphone.and.arrow.forward"
+                            )
+                            .fontWeight(.semibold)
+                            if isPushingTVLogin {
+                                Spacer()
+                                ProgressView()
+                            }
+                        }
+                    }
+                    .disabled(!authManager.isAuthenticated || isPushingTVLogin || draftTVHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                    Button {
+                        Task {
+                            do {
+                                let code = try await authManager.exportSessionCode()
+                                UIPasteboard.general.string = code
+                                copiedSessionCode = true
+                                tvPushStatus = "Session Code copied to clipboard."
+                                tvPushIsError = false
+                            } catch {
+                                tvPushStatus = error.localizedDescription
+                                tvPushIsError = true
+                            }
+                        }
+                    } label: {
+                        Label(
+                            copiedSessionCode ? "Session Code Copied ✓" : "Copy Session Code",
+                            systemImage: "doc.on.doc"
+                        )
+                    }
+                    .disabled(!authManager.isAuthenticated)
+
+                    if let tvPushStatus {
+                        Text(tvPushStatus)
+                            .font(.caption)
+                            .foregroundStyle(tvPushIsError ? .red : .green)
+                    }
+                } header: {
+                    Text("Sign In My TV (Shield / Fire TV)")
+                } footer: {
+                    Text("Push your active iPhone Google login straight to Nvidia Shield or Fire TV over Wi-Fi (:8766), or copy a Session Code to paste at http://<tv-ip>:8766.")
+                }
+
                 Section("Account") {
+                    Text(authManager.tokenDiagnostics)
+                        .font(.caption)
+                        .foregroundStyle(authManager.lastRefreshError == nil ? .secondary : .orange)
+                        .textSelection(.enabled)
+
                     if authManager.isAuthenticated {
                         Button(role: .destructive) {
                             authManager.signOut()
